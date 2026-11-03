@@ -25,6 +25,23 @@ python scripts/run_qwen3_4b.py full-train --train-backend fsdp --true-on-policy
 
 In order to quickly see the curve, you may use `--mode debug_minimal`, which will skip evaluation and run generation with a very short output sequence length. Since true on policy is unrelated to OSL or answer correctness, this can be used for quick experiments.
 
+### Example 3: Qwen3-30B-A3B (MoE)
+
+```bash
+python examples/infra_features/true_on_policy/run_qwen3_30b_a3b.py --mode debug_minimal --r3
+```
+
+The `qwen3_moe_true_on_policy_v1` contract makes the FSDP trainer bitwise equal to SGLang's decode, which samples the tokens. The trainer uses the logprobs and routing recorded during sampling; nothing is re-scored. The contract covers Qwen3-30B-A3B (Base and Instruct-2507 too) with single-GPU rollout engines.
+
+* Attention: SGLang's vendored FlashAttention-4 on both sides, in batch-invariant mode with one KV split. Its decode and prefill walk the KV in the same tiles. The trainer (`miles/backends/fsdp_utils/sglang_attn_bridge/hf_fa4_patch.py`) calls it the way SGLang's decode does, on a page-size-1 view of its packed documents. Gradients come from the deterministic `flash_attn.cute` backward.
+* Experts: SGLang's Triton fused-MoE kernels at their deterministic config on both sides, with Triton backward kernels in the trainer. Routing is transformers' `Qwen3MoeTopKRouter`, which computes what SGLang's on-policy routing branch computes.
+* SGLang plugin (`miles_plugins/sglang/true_on_policy.py`, a `sglang.srt.plugins` entry point): it registers `qwen3_moe_true_on_policy_v1` with SGLang, which only ships the dense contract, giving it the same model-agnostic runtime policy. It also sets the `top_k` that SGLang's on-policy routing branch needs and adds the routed-experts capture that the branch skips, so rollout routing replay (`--r3`) works. Reinstall Miles (`pip install -e .`) after pulling so that SGLang finds the entry point; without it the engines reject the contract name at startup.
+* Old-policy logprobs: the contract passes `--use-rollout-logprobs`, so the PPO ratio uses the sampler's logprobs. `train/train_rollout_logprob_abs_diff` still compares the training forward with them on every step.
+
+On one 8×B200 node (colocated, Qwen3-30B-A3B-Base, math prompts, R3, 12 steps × 256 samples with up to 8192-token responses), `train/train_rollout_logprob_abs_diff` is 0 on every step and the per-token dumps (`--dump-details`) show 0 mismatches in about 3.0M tokens. Rollout throughput is about 2040 tok/s for the node.
+
+Megatron and TP rollout are not supported.
+
 ### Other Cases
 
 In order to support true on policy for other cases, please refer to the flags changed in the examples above.

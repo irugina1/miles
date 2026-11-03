@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .contracts import QWEN3_DENSE_TRUE_ON_POLICY_V1, LogprobContract, ModelFamily, TrueOnPolicyContract
+from .contracts import (
+    QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    QWEN3_MOE_TRUE_ON_POLICY_V1,
+    LogprobContract,
+    ModelFamily,
+    TrueOnPolicyContract,
+)
 
 ParallelLayout = str
 
@@ -79,7 +85,30 @@ QWEN3_DENSE_PROFILE = TrueOnPolicyModelProfile(
 )
 
 
-_MODEL_PROFILES = (QWEN3_DENSE_PROFILE,)
+# FSDP only: Megatron true-on-policy is not available in this Megatron version (see
+# miles/backends/megatron_utils/arguments.py). Rollout engines are single-GPU (one TP1 engine holds
+# the bf16 model); TP rollout would need TP-invariant row-parallel experts, which SGLang does not
+# provide for the fused-MoE kernels.
+QWEN3_MOE_PROFILE = TrueOnPolicyModelProfile(
+    family="qwen3_moe",
+    model_names=(
+        "Qwen3-30B-A3B",
+        "Qwen3-30B-A3B-Base",
+        "Qwen3-30B-A3B-Instruct-2507",
+    ),
+    megatron_model_types={
+        "Qwen3-30B-A3B": "qwen3-30B-A3B",
+        "Qwen3-30B-A3B-Base": "qwen3-30B-A3B",
+        "Qwen3-30B-A3B-Instruct-2507": "qwen3-30B-A3B",
+    },
+    supported_train_layouts=("dp",),
+    supported_rollout_layouts=("dp",),
+    contract=QWEN3_MOE_TRUE_ON_POLICY_V1,
+    supports_megatron=False,
+)
+
+
+_MODEL_PROFILES = (QWEN3_DENSE_PROFILE, QWEN3_MOE_PROFILE)
 _PROFILE_BY_MODEL_NAME = {model_name: profile for profile in _MODEL_PROFILES for model_name in profile.model_names}
 
 

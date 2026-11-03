@@ -15,13 +15,12 @@ register_cuda_ci(
     suite="stage-b-2-gpu-h200",
     labels=["precision"],
     hardware=["hopper", "blackwell"],
-    disabled="the fused MoE backward needs sglang.srt.layers.moe.fused_moe_triton.fused_moe, removed by the sglang 0.5.20 bump (#3321)",
     num_gpus=2,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 pytest.importorskip(
-    "sglang.srt.layers.moe.fused_moe_triton.fused_moe", reason="the fused MoE kernel needs sglang's Triton fused_moe"
+    "sglang.kernels.ops.moe.fused_moe_triton_kernels", reason="the fused MoE kernel needs sglang's Triton fused_moe"
 )
 
 # ============================================================================

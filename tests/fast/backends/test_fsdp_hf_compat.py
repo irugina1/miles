@@ -180,9 +180,32 @@ def test_unknown_model_type_runs_the_stock_hf_path():
     assert not adapter.verified and adapter.routing_replay is None
 
 
-def test_qwen3_moe_class_patch_is_inert_outside_true_on_policy():
+def test_qwen3_moe_patch_is_inert_outside_true_on_policy(tiny_qwen3_moe):
     # Batched experts need no off-mode patch under the pinned transformers version.
-    _adapter("qwen3_moe").patch_classes(SimpleNamespace(true_on_policy_mode=False))
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts
+
+    model = type(tiny_qwen3_moe)(tiny_qwen3_moe.config)
+    adapter = _adapter("qwen3_moe")
+    adapter.patch_classes(SimpleNamespace(true_on_policy_mode=False))
+    adapter.patch_model(model, SimpleNamespace(true_on_policy_mode=False))
+    assert all(type(m) is Qwen3MoeExperts for m in model.modules() if isinstance(m, Qwen3MoeExperts))
+
+
+def test_qwen3_moe_true_on_policy_swaps_experts_and_keeps_router(tiny_qwen3_moe):
+    pytest.importorskip("sglang.kernels.ops.moe.fused_moe_triton_kernels")
+    from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts, Qwen3MoeTopKRouter
+
+    from miles.backends.fsdp_utils.models.qwen3_moe import Qwen3MoeTrueOnPolicyExperts
+
+    model = type(tiny_qwen3_moe)(tiny_qwen3_moe.config)
+    names_before = [name for name, _ in model.named_parameters()]
+    _adapter("qwen3_moe").patch_model(model, SimpleNamespace(true_on_policy_mode=True))
+
+    experts = [m for m in model.modules() if isinstance(m, Qwen3MoeExperts)]
+    assert experts and all(type(m) is Qwen3MoeTrueOnPolicyExperts for m in experts)
+    assert any(type(m) is Qwen3MoeTopKRouter for m in model.modules())
+    # The checkpoint layout (and so weight sync to SGLang) is unchanged.
+    assert [name for name, _ in model.named_parameters()] == names_before
 
 
 def test_validate_hf_config_rejects_fp8_checkpoints():

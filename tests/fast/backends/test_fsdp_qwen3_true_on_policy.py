@@ -56,12 +56,20 @@ def _tiny_config():
 
 def test_qwen3_model_patch_is_contract_gated(monkeypatch):
     from miles.backends.fsdp_utils.models import qwen3 as qwen3_model
+    from miles.backends.fsdp_utils.models import qwen3_moe as qwen3_moe_model
 
     calls = []
+    moe_calls = []
     monkeypatch.setattr(
         qwen3_model,
         "apply_qwen3_dense_true_on_policy_patch",
         lambda model: calls.append(model),
+    )
+    # qwen3_moe has its own true-on-policy patch; the dense one must still not leak into it
+    monkeypatch.setattr(
+        qwen3_moe_model,
+        "apply_qwen3_moe_true_on_policy_patch",
+        lambda model, *args: moe_calls.append(model),
     )
     model = object()
     formal_contract = QWEN3_DENSE_TRUE_ON_POLICY_V1.name
@@ -81,6 +89,7 @@ def test_qwen3_model_patch_is_contract_gated(monkeypatch):
             ),
         )
     assert calls == []
+    assert moe_calls == [model]
 
     args = SimpleNamespace(
         backend=SimpleNamespace(fp16=False),

@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import torch
 import triton.language as tl
-from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (
-    invoke_fused_moe_kernel,
-    moe_align_block_size,
-    moe_sum_reduce,
-    silu_and_mul,
-)
+from sgl_kernel import moe_sum_reduce
 
 from miles.kernels.moe.fused_experts_bwd import invoke_fused_moe_backward_kernel
+from sglang.kernels.ops.activation.activation import silu_and_mul
+from sglang.kernels.ops.moe.fused_moe_triton_kernels import invoke_fused_moe_kernel
+from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import moe_align_block_size
 
 
 class GateUpProjFunction(torch.autograd.Function):
@@ -79,8 +77,12 @@ class GateUpProjFunction(torch.autograd.Function):
                 use_int4_w4a16=False,
                 per_channel_quant=False,
                 block_shape=None,
+                # SGLang enables TMA only for tuned configs that ask for it; the deterministic config does not
+                a_use_tma=False,
+                b_use_tma=False,
                 c_sorted=False,
-                filter_expert=True,
+                # SGLang's runner passes False when every expert is local (no EP)
+                filter_expert=False,
             )
 
         ctx.save_for_backward(hidden_states, w1, topk_weights, topk_ids)
@@ -268,6 +270,8 @@ class DownProjFunction(torch.autograd.Function):
                 block_shape=None,
                 a_use_tma=False,
                 b_use_tma=False,
+                filter_expert=False,
+                router_topk=topk,
             )
 
         ctx.save_for_backward(intermediate_cache2, w2, topk_weights, topk_ids)
@@ -365,6 +369,8 @@ class MoeSumReduceFunction(torch.autograd.Function):
         out_hidden_states = torch.empty(
             hidden_states_shape, device=intermediate_cache3.device, dtype=intermediate_cache3.dtype
         )
+        # SGLang's runner combines with this same kernel under deterministic inference (its
+        # torch.compile path for small batches is disabled there).
         moe_sum_reduce(
             intermediate_cache3,
             out_hidden_states,
@@ -386,6 +392,7 @@ def fused_experts(
     topk_weights: torch.Tensor,
     topk_ids: torch.Tensor,
 ):
+    """SGLang's Triton fused MoE (forward bitwise equal to its runner at the deterministic config)."""
     assert hidden_states.shape[1] == w1.shape[2], "Hidden size mismatch"
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert hidden_states.is_contiguous(), "Hidden_states must be contiguous"

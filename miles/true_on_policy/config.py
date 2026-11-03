@@ -76,6 +76,8 @@ class TrueOnPolicyKernelPolicy:
             "--sglang-attention-backend",
             self.sglang_attention_backend,
         ]
+        if self.contract.sglang_moe_runner_backend is not None:
+            values.extend(["--sglang-moe-runner-backend", self.contract.sglang_moe_runner_backend])
         if self.deterministic_inference:
             values.insert(0, "--sglang-enable-deterministic-inference")
         return TrueOnPolicyArgList(tuple(values))
@@ -204,13 +206,12 @@ class TrueOnPolicyConfig:
     def build_launch_plan(self) -> TrueOnPolicyLaunchPlan:
         self.validate()
         kernel_policy = self.build_kernel_policy()
-        miles_args = TrueOnPolicyArgList(
-            (
-                "--deterministic-mode",
-                "--true-on-policy-mode",
-                "--recompute-logprobs-via-prefill",
-            )
-        )
+        miles_args = ("--deterministic-mode", "--true-on-policy-mode")
+        if self.contract.logprob_contract == "sglang_prefill":
+            miles_args += ("--recompute-logprobs-via-prefill",)
+        else:  # sglang_decode: the sampler's logprobs are the trainer's, so the PPO ratio uses them
+            miles_args += ("--use-rollout-logprobs",)
+        miles_args = TrueOnPolicyArgList(miles_args)
 
         if self.train_backend == "megatron":
             megatron_args = kernel_policy.build_megatron_args()

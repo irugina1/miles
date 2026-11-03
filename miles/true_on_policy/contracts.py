@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from .schema import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
+    QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA,
     KernelContract,
     LogprobContract,
     ModelFamily,
@@ -39,6 +40,10 @@ class TrueOnPolicyContract:
         return self.schema.sglang_attention_backend
 
     @property
+    def sglang_moe_runner_backend(self) -> str | None:
+        return self.schema.sglang_moe_runner_backend
+
+    @property
     def fsdp_attention_implementation(self) -> str:
         return self.schema.fsdp_attention_implementation
 
@@ -72,8 +77,14 @@ QWEN3_DENSE_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
 )
 
 
+QWEN3_MOE_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
+    schema=QWEN3_MOE_TRUE_ON_POLICY_V1_SCHEMA,
+)
+
+
 _CONTRACT_BY_NAME = {
     QWEN3_DENSE_TRUE_ON_POLICY_V1.name: QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    QWEN3_MOE_TRUE_ON_POLICY_V1.name: QWEN3_MOE_TRUE_ON_POLICY_V1,
 }
 
 

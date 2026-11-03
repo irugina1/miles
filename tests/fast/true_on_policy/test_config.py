@@ -6,6 +6,7 @@ import pytest
 
 from miles.true_on_policy import (
     QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    QWEN3_MOE_TRUE_ON_POLICY_V1,
     apply_true_on_policy_script_defaults,
     build_true_on_policy_launch_plan,
     get_megatron_model_type,
@@ -258,3 +259,72 @@ def test_off_policy_builds_empty_launch_plan_and_does_not_mutate_args():
     assert not plan.enabled
     assert plan.train_args == ""
     assert plan.env_vars == {}
+
+
+def _moe_args(**overrides):
+    values = {
+        "model_name": "Qwen3-30B-A3B-Base",
+        "train_backend": "fsdp",
+        "tensor_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "rollout_num_gpus_per_engine": 1,
+        "use_sequence_parallel": False,
+    }
+    values.update(overrides)
+    return _args(**values)
+
+
+def test_qwen3_moe_profile_resolves_model_names():
+    profile = get_true_on_policy_model_profile("Qwen3-30B-A3B-Base")
+
+    assert profile.family == "qwen3_moe"
+    assert profile.contract is QWEN3_MOE_TRUE_ON_POLICY_V1
+    assert profile.contract is get_true_on_policy_contract("qwen3_moe_true_on_policy_v1")
+    assert profile.required_kernel_contracts == ("qwen3_moe_sglang_math",)
+    assert profile.logprob_contract == "sglang_decode"
+    assert not profile.supports_megatron
+    assert not profile.supports_ulysses_cp
+    assert not profile.supports_tp_invariant
+    assert get_megatron_model_type("Qwen3-30B-A3B") == "qwen3-30B-A3B"
+
+
+def test_qwen3_moe_fsdp_plan_matches_the_sampler_with_fa4_and_triton_experts():
+    plan = build_true_on_policy_launch_plan(_moe_args())
+
+    assert plan.contract is QWEN3_MOE_TRUE_ON_POLICY_V1
+    assert plan.sglang_target == "fsdp"
+    assert plan.sglang_args.values == (
+        "--sglang-enable-deterministic-inference",
+        "--sglang-true-on-policy-contract",
+        "qwen3_moe_true_on_policy_v1",
+        "--sglang-attention-backend",
+        "fa4",
+        "--sglang-moe-runner-backend",
+        "triton",
+    )
+    assert plan.fsdp_args.values == ("--attn-implementation", "fa4")
+    assert plan.megatron_args.values == ()
+    # the trainer matches the decode that sampled each rollout: nothing is re-scored, and the PPO
+    # ratio uses the sampler's logprobs
+    assert "--recompute-logprobs-via-prefill" not in plan.train_args
+    assert "--use-rollout-logprobs" in plan.train_args
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"train_backend": "megatron"}, "does not support Megatron"),
+        ({"rollout_num_gpus_per_engine": 2}, "does not support TP-invariant"),
+        ({"context_parallel_size": 2}, "does not support Ulysses CP"),
+    ],
+)
+def test_qwen3_moe_rejects_unsupported_layouts(overrides, match):
+    with pytest.raises(ValueError, match=match):
+        build_true_on_policy_launch_plan(_moe_args(**overrides))
+
+
+def test_qwen3_moe_contract_cannot_be_forced_onto_a_dense_model():
+    with pytest.raises(ValueError, match="is for qwen3_moe"):
+        build_true_on_policy_launch_plan(
+            _args(train_backend="fsdp", true_on_policy_contract=QWEN3_MOE_TRUE_ON_POLICY_V1.name)
+        )
