@@ -81,12 +81,13 @@ def execute(args: ScriptArgs) -> None:
         f"--update-weight-buffer-size {512 * 1024 * 1024} "
         """--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}' """
     )
+    # rollout GPUs across all nodes
     if args.colocate:
-        rollout_num_gpus = args.num_gpus_per_node
+        rollout_num_gpus = args.num_gpus_per_node * args.num_nodes
         placement_args = f"--colocate --actor-num-gpus-per-node {args.num_gpus_per_node} "
         sglang_mem = 0.6
     else:
-        rollout_num_gpus = args.num_gpus_per_node - args.actor_num_gpus
+        rollout_num_gpus = (args.num_gpus_per_node - args.actor_num_gpus) * args.num_nodes
         placement_args = f"--actor-num-gpus-per-node {args.actor_num_gpus} --rollout-num-gpus {rollout_num_gpus} "
         sglang_mem = 0.8
     sglang_args = (
