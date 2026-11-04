@@ -16,12 +16,18 @@ class Qwen3MoeAdapter(ArchAdapter):
     )
 
     def patch_model(self, model, args):
+        from miles.kernels.moe.mx_fused_moe import moe_mx_format
+
         if not args.true_on_policy_mode:
+            if moe_mx_format() is not None:
+                # the SGLang plugin would quantize the sampler's experts while the trainer computes bf16
+                raise ValueError("MILES_MOE_QUANT requires --true-on-policy-mode")
             return
         # Lazy: pulls sglang fused-MoE kernels that don't exist for every sglang build.
         from miles.backends.fsdp_utils.models.qwen3_moe import apply_qwen3_moe_true_on_policy_patch
+        from miles.backends.fsdp_utils.quantization import rollout_quantization_config
 
-        apply_qwen3_moe_true_on_policy_patch(model)
+        apply_qwen3_moe_true_on_policy_patch(model, rollout_quantization_config(args), moe_mx_format())
 
     def param_transform(self, name, param):
         return unfuse_batched_experts if is_batched_experts_param(name, param) else None

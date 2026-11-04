@@ -1,8 +1,12 @@
 """SGLang hooks for the Qwen3-MoE true-on-policy contract.
 
-SGLang loads this module through the ``sglang.srt.plugins`` entry point in every engine process. See
+SGLang loads this module through the ``sglang.srt.plugins`` entry point in every engine process. With
+``MILES_MOE_QUANT`` set it also runs the experts with Miles' microscaling kernels. See
 ``examples/infra_features/true_on_policy/README.md`` for what each hook is for.
 """
+
+import logging
+import re
 
 import torch
 
@@ -10,6 +14,12 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 
 _QWEN3_MOE_BLOCK_INIT = "sglang.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.__init__"
 _QWEN3_MOE_FORWARD_NORMAL = "sglang.srt.models.qwen3_moe.Qwen3MoeSparseMoeBlock.forward_normal"
+_QWEN3_MOE_LOAD_WEIGHTS = "sglang.srt.models.qwen3_moe.Qwen3MoeForCausalLM.load_weights"
+_UNQUANT_MOE_FORWARD_CUDA = "sglang.srt.layers.quantization.unquant.UnquantizedFusedMoEMethod.forward_cuda"
+_EXPERT_LAYER = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts\.")
+_CACHE_ATTR = "_miles_mx_experts"
+
+logger = logging.getLogger(__name__)
 
 
 def _set_qwen3_moe_top_k(result, self, *args, **kwargs):
@@ -52,6 +62,50 @@ def _qwen3_moe_forward_normal(original, self, hidden_states, *args, **kwargs):
     return final_hidden_states.view(num_tokens, hidden_dim)
 
 
+def _refresh_mx_experts(model, layer_ids, fmt: str) -> None:
+    """Re-quantize the experts of ``layer_ids`` into the cached buffers, in place, so captured CUDA
+    graphs keep reading valid weights."""
+    from miles.kernels.moe.mx_fused_moe import quantize_experts
+
+    for layer_id in sorted(layer_ids):
+        experts = model.model.layers[layer_id].mlp.experts
+        cached = getattr(experts, _CACHE_ATTR, None)  # config-access-exempt: set below on first load
+        w13 = quantize_experts(experts.w13_weight, fmt, out=None if cached is None else cached[0])
+        w2 = quantize_experts(experts.w2_weight, fmt, out=None if cached is None else cached[1])
+        setattr(experts, _CACHE_ATTR, (w13, w2))  # config-access-exempt: plugin-owned cache attribute
+
+
+def _make_load_weights_hook(fmt: str):
+    def _load_weights(original, self, weights, *args, **kwargs):
+        touched = set()
+
+        def recorded():
+            for name, tensor in weights:
+                if match := _EXPERT_LAYER.search(name):
+                    touched.add(int(match.group(1)))
+                yield name, tensor
+
+        result = original(self, recorded(), *args, **kwargs)
+        _refresh_mx_experts(self, touched, fmt)
+        return result
+
+    return _load_weights
+
+
+def _mx_moe_forward_cuda(original, self, layer, dispatch_output, *args, **kwargs):
+    cached = getattr(layer, _CACHE_ATTR, None)  # config-access-exempt: only Qwen3-MoE experts carry it
+    if cached is None:
+        return original(self, layer, dispatch_output, *args, **kwargs)
+    from miles.kernels.moe.mx_fused_moe import mx_fused_experts
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+
+    topk_output = dispatch_output.topk_output
+    out = mx_fused_experts(
+        dispatch_output.hidden_states, cached[0], cached[1], topk_output.topk_weights, topk_output.topk_ids
+    )
+    return StandardCombineInput(hidden_states=out)
+
+
 def _register_moe_contract() -> None:
     """Add Miles' Qwen3-MoE contract to SGLang's contract table, which only ships the dense one.
     SGLang's runtime policy does not depend on the model, so the MoE contract gets the same switches;
@@ -72,3 +126,9 @@ def register() -> None:
     HookRegistry.register(_QWEN3_MOE_BLOCK_INIT, _set_qwen3_moe_top_k, HookType.AFTER)
     HookRegistry.register(_QWEN3_MOE_FORWARD_NORMAL, _qwen3_moe_forward_normal, HookType.AROUND)
 
+    from miles.kernels.moe.mx_fused_moe import moe_mx_format
+
+    if (fmt := moe_mx_format()) is not None:
+        HookRegistry.register(_QWEN3_MOE_LOAD_WEIGHTS, _make_load_weights_hook(fmt), HookType.AROUND)
+        HookRegistry.register(_UNQUANT_MOE_FORWARD_CUDA, _mx_moe_forward_cuda, HookType.AROUND)
+        logger.warning(f"Miles plugin: Qwen3-MoE experts run the {fmt} microscaling kernels")

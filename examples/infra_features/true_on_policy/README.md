@@ -39,6 +39,49 @@ On one 8×B200 node (colocated, Qwen3-30B-A3B-Base, math prompts, R3, 12 steps �
 
 Megatron and TP rollout are not supported.
 
+#### Quantized experts
+
+True-on-policy runs can quantize the routed MoE experts to block FP8, MXFP8, MXFP4 or NVFP4. Only the routed experts are quantized: attention, router, norms, embeddings and LM head stay in bf16, and the trainer keeps fp32 master weights. In every format the trainer's expert forward runs the sampler's kernels on the same quantized weights and activations, so the two stay bitwise equal. The backward is a bf16 GEMM (fp32 accumulation) on the dequantized operands, dequant(Q(W)) and dequant(Q(X)), and the gradients go to the master weights.
+
+The formats fall into two cases, depending on whether SGLang already has a batch-invariant kernel for them:
+
+* Block FP8 does. The engines serve an FP8 checkpoint through SGLang's own FP8 path, and the trainer calls the same batch-invariant kernel.
+* MXFP8, MXFP4 and NVFP4 do not: SGLang's kernels for them autotune their tiling by batch size, so they are not batch-invariant. Miles brings its own batch-invariant kernels and runs them on both sides; the engines keep a bf16 model and the SGLang plugin swaps the kernels in.
+
+On one 8×B200 node (R3, `--mode debug_minimal`, 4 steps each), `train/train_rollout_logprob_abs_diff` is 0 on every step in all four formats.
+
+##### Block FP8: SGLang's FP8 path
+
+W8A8 with e4m3 weights in 128×128 blocks and fp32 scales; activations are quantized per 128-wide token group.
+
+```bash
+# once: an experts-only FP8 copy of the model; Miles syncs the trainer's weights before the first rollout
+python tools/convert_hf_to_fp8.py --model-dir /root/models/Qwen3-30B-A3B-Base \
+    --save-dir /root/models/Qwen3-30B-A3B-Base-FP8-experts --strategy block --block-size 128 128 \
+    --extra-high-precision-layers-hf self_attn
+
+python examples/infra_features/true_on_policy/run_qwen3_30b_a3b.py --mode debug_minimal --r3 \
+    --rollout-fp8-checkpoint /root/models/Qwen3-30B-A3B-Base-FP8-experts
+```
+
+The engines serve the FP8 copy. The trainer reads its `quantization_config` (`miles/backends/fsdp_utils/quantization.py`): each weight sync quantizes the experts with the kernel the trainer uses, and the trainer's forward runs SGLang's FP8 W8A8 Triton fused-MoE path. Weight sync rejects a checkpoint that quantizes anything other than the routed experts.
+
+##### MXFP8, MXFP4 and NVFP4: Miles' kernels on both sides
+
+```bash
+python examples/infra_features/true_on_policy/run_qwen3_30b_a3b.py --mode debug_minimal --r3 --moe-quant mxfp8  # or mxfp4, nvfp4
+```
+
+| `--moe-quant` | elements | block scale | MMA instruction |
+| --- | --- | --- | --- |
+| `mxfp8` | e4m3 | e8m0 per 32 | `tcgen05.mma kind::mxf8f6f4 block32` |
+| `mxfp4` | e2m1 | e8m0 per 32 | `tcgen05.mma kind::mxf4 block32` |
+| `nvfp4` | e2m1 | e4m3 per 16, times an fp32 scale per expert (weights) or per token (activations) | `tcgen05.mma kind::mxf4nvf4 block16` |
+
+The kernels are in `miles/kernels/moe/mx_fused_moe.py` (Triton `tl.dot_scaled`). The quantizers work row by row and the GEMM uses one fixed tile config without split-K, so the kernels are batch-invariant. NVFP4 uses a per-token activation scale for the same reason.
+
+The trainer quantizes its bf16 experts on every forward. The engines receive bf16 weights; after each weight sync the SGLang plugin re-quantizes the experts in place into a cached buffer, so captured CUDA graphs stay valid. The launcher sets `MILES_MOE_QUANT` for every process to select the format.
+
 ### Other Cases
 
 In order to support true on policy for other cases, please refer to the flags changed in the examples above.

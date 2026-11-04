@@ -160,6 +160,7 @@ def test_the_iterator_streams_params_without_a_transform_unchanged():
     iterator.args = SimpleNamespace(update_weight_buffer_size=1 << 30)
     iterator._sync_dtypes = {}
     iterator._arch_adapter = _adapter("qwen3_5_moe")
+    iterator.quantization_config = None
     with patch.object(hf_weight_iterator, "gather_full_param", lambda t, async_op=False: t):
         units = list(iterator._iter_hf_param_units(None, materialize=True))
     assert [[name for name, _ in unit] for unit in units] == [
@@ -191,11 +192,24 @@ def test_qwen3_moe_patch_is_inert_outside_true_on_policy(tiny_qwen3_moe):
     assert all(type(m) is Qwen3MoeExperts for m in model.modules() if isinstance(m, Qwen3MoeExperts))
 
 
-def test_qwen3_moe_true_on_policy_swaps_experts_and_keeps_router(tiny_qwen3_moe):
+def test_microscaling_experts_require_true_on_policy(tiny_qwen3_moe, monkeypatch):
+    # the SGLang plugin would quantize the sampler's experts while the trainer stays in bf16
+    monkeypatch.setenv("MILES_MOE_QUANT", "mxfp8")
+    model = type(tiny_qwen3_moe)(tiny_qwen3_moe.config)
+    with pytest.raises(ValueError, match="requires --true-on-policy-mode"):
+        _adapter("qwen3_moe").patch_model(model, SimpleNamespace(true_on_policy_mode=False))
+
+
+@pytest.mark.parametrize("rollout_fp8", [False, True])
+def test_qwen3_moe_true_on_policy_swaps_experts_and_keeps_router(tiny_qwen3_moe, monkeypatch, rollout_fp8):
     pytest.importorskip("sglang.kernels.ops.moe.fused_moe_triton_kernels")
     from transformers.models.qwen3_moe.modeling_qwen3_moe import Qwen3MoeExperts, Qwen3MoeTopKRouter
 
+    from miles.backends.fsdp_utils import quantization
     from miles.backends.fsdp_utils.models.qwen3_moe import Qwen3MoeTrueOnPolicyExperts
+
+    fp8_experts = {"quant_method": "fp8", "weight_block_size": [128, 128], "modules_to_not_convert": ["lm_head"]}
+    monkeypatch.setattr(quantization, "rollout_quantization_config", lambda args: fp8_experts if rollout_fp8 else None)
 
     model = type(tiny_qwen3_moe)(tiny_qwen3_moe.config)
     names_before = [name for name, _ in model.named_parameters()]
@@ -203,6 +217,8 @@ def test_qwen3_moe_true_on_policy_swaps_experts_and_keeps_router(tiny_qwen3_moe)
 
     experts = [m for m in model.modules() if isinstance(m, Qwen3MoeExperts)]
     assert experts and all(type(m) is Qwen3MoeTrueOnPolicyExperts for m in experts)
+    # experts the rollout serves in FP8 run the FP8 forward too
+    assert all(m.fp8_block_shape == ([128, 128] if rollout_fp8 else None) for m in experts)
     assert any(type(m) is Qwen3MoeTopKRouter for m in model.modules())
     # The checkpoint layout (and so weight sync to SGLang) is unchanged.
     assert [name for name, _ in model.named_parameters()] == names_before

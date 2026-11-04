@@ -92,6 +92,12 @@ class TorchNativeTrainRayActor(TrainRayActor):
     def train_parallel_config(self) -> TrainParallelConfig:
         return get_parallel_state().train_parallel_config(supports_precomputed_schedule=False)
 
+    def _rollout_quantization_config(self) -> dict | None:
+        """How weights synced to the rollout engines are quantized; None sends them as trained."""
+        return getattr(
+            self.hf_config, "quantization_config", None
+        )  # config-access-exempt: unquantized HF checkpoints omit quantization_config
+
     def _build_weight_updater(self, model, iterator_factory: Callable) -> WeightUpdater:
         self._published_weight_version = 0
         model_name = self.args.model_name
@@ -103,9 +109,7 @@ class TorchNativeTrainRayActor(TrainRayActor):
             model,
             weights_getter=lambda: None,
             model_name=model_name,
-            quantization_config=getattr(
-                self.hf_config, "quantization_config", None
-            ),  # config-access-exempt: unquantized HF checkpoints omit quantization_config
+            quantization_config=self._rollout_quantization_config(),
             iterator_factory=iterator_factory,
             parallel_state=get_parallel_state(),
             is_lora=is_lora,

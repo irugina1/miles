@@ -66,6 +66,9 @@ def test_qwen3_model_patch_is_contract_gated(monkeypatch):
         lambda model: calls.append(model),
     )
     # qwen3_moe has its own true-on-policy patch; the dense one must still not leak into it
+    from miles.backends.fsdp_utils import quantization
+
+    monkeypatch.setattr(quantization, "rollout_quantization_config", lambda args: None)
     monkeypatch.setattr(
         qwen3_moe_model,
         "apply_qwen3_moe_true_on_policy_patch",

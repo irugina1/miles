@@ -8,6 +8,7 @@ examples/infra_features/true_on_policy/README.md.
 
 ``--mode debug_minimal`` runs a few short steps. ``--r3`` replays the sampler's expert routing.
 ``--async-rollout`` (with ``--no-colocate``) generates rollout i+1 while step i trains.
+``--rollout-fp8-checkpoint`` and ``--moe-quant`` quantize the routed experts.
 """
 
 from dataclasses import dataclass
@@ -15,6 +16,7 @@ from typing import Literal
 
 import typer
 
+from miles.kernels.moe.mx_fused_moe import MOE_QUANT_ENV
 from miles.true_on_policy import apply_true_on_policy_script_defaults, build_true_on_policy_launch_plan
 from miles.utils.external_utils import command_utils
 
@@ -35,6 +37,10 @@ class ScriptArgs(command_utils.ExecuteTrainConfig):
     max_tokens_per_gpu: int = 16384
     true_on_policy: bool = True
     true_on_policy_contract: str | None = None
+    # experts-only block-FP8 copy of the model, served by the rollout engines
+    rollout_fp8_checkpoint: str | None = None
+    # W+A microscaling quantization of the routed experts on both sides
+    moe_quant: Literal["mxfp8", "mxfp4", "nvfp4"] | None = None
     # rollout routing replay: training replays the experts the sampler selected
     r3: bool = False
     # one step of constant staleness: rollout i+1 is generated while step i trains (train_async.py)
@@ -87,6 +93,19 @@ def execute(args: ScriptArgs) -> None:
         f"--rollout-num-gpus-per-engine {args.rollout_num_gpus_per_engine} "
         f"--sglang-mem-fraction-static {sglang_mem} --sglang-chunked-prefill-size 4096 "
     )
+    if args.rollout_fp8_checkpoint is not None:
+        # The engines serve the FP8 copy and still receive every weight sync; the FSDP trainer
+        # reads its quantization_config to quantize synced weights and its own MoE forward.
+        sglang_config = f"""
+sglang:
+  - name: default
+    model_path: {args.rollout_fp8_checkpoint}
+    update_weights: true
+    server_groups:
+      - worker_type: regular
+        num_gpus: {rollout_num_gpus}
+"""
+        sglang_args += f"--sglang-config {command_utils.encode_pseudo_file(sglang_config)} "
     misc_args = f"--actor-num-nodes {args.num_nodes} --num-gpus-per-node {args.num_gpus_per_node} "
     if args.r3:
         misc_args += "--use-rollout-routing-replay "
@@ -100,6 +119,15 @@ def execute(args: ScriptArgs) -> None:
         f"{plan.train_args}{args.extra_args} "
     )
 
+    env_vars = dict(plan.env_vars)
+    if args.moe_quant is not None:
+        if args.rollout_fp8_checkpoint is not None:
+            raise ValueError("--moe-quant and --rollout-fp8-checkpoint are alternatives")
+        if not args.true_on_policy:
+            raise ValueError("--moe-quant requires true on-policy")
+        # read by the FSDP trainer and by the SGLang engines (Miles' SGLang plugin)
+        env_vars[MOE_QUANT_ENV] = args.moe_quant
+
     if args.async_rollout and args.colocate:
         raise ValueError("--async-rollout needs --no-colocate")
     U.execute_train(
@@ -107,7 +135,7 @@ def execute(args: ScriptArgs) -> None:
         train_script="train_async.py" if args.async_rollout else "train.py",
         num_gpus_per_node=args.num_gpus_per_node,
         megatron_model_type=None,
-        extra_env_vars=dict(plan.env_vars),
+        extra_env_vars=env_vars,
     )
 
 

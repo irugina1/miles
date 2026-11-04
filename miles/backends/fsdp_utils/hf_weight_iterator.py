@@ -6,6 +6,7 @@ from torch.distributed._functional_collectives import AsyncCollectiveTensor
 
 from miles.backends.fsdp_utils.adaptations.specs import resolve_arch_adapter
 from miles.backends.fsdp_utils.dtensor import gather_full_param
+from miles.backends.fsdp_utils.quantization import quantize_hf_tensor
 from miles.backends.training_utils.weight_update.hf_weight_iterator import HfWeightIteratorBase
 from miles.backends.training_utils.weight_update.hf_weight_iterator.atomic_groups import get_hf_atomic_update_groups
 
@@ -42,12 +43,21 @@ class FSDPHfWeightIterator(HfWeightIteratorBase):
             full = self._to_sync_dtype(name, full)
             expand = self._arch_adapter.param_transform(name, param)
             if expand is None:
-                yield [(name, full)]
+                unit = [(name, full)]
             else:
-                yield [
+                unit = [
                     (hf_name, self._to_sync_dtype(hf_name, tensor))
                     for hf_name, tensor in expand(name, full, self.model)
                 ]
+            if self.quantization_config is not None:
+                # Quantize after the sync-dtype cast: the trainer's quantized forward quantizes
+                # the same bf16 values (see miles/backends/fsdp_utils/quantization.py).
+                unit = [
+                    q
+                    for hf_name, tensor in unit
+                    for q in quantize_hf_tensor(self.quantization_config, hf_name, tensor)
+                ]
+            yield unit
 
     def _to_sync_dtype(self, name: str, tensor: torch.Tensor) -> torch.Tensor:
         target = self._sync_dtypes.get(name)

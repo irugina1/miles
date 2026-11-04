@@ -9,6 +9,7 @@ import torch.distributed as dist
 from miles.backends.fsdp_utils import checkpoint
 from miles.backends.fsdp_utils.adaptations import routing_replay
 from miles.backends.fsdp_utils.config import FsdpArgsNamespace
+from miles.backends.fsdp_utils.quantization import rollout_quantization_config
 from miles.backends.megatron_utils.checkpoint_request import MegatronCkptLoadConfig
 from miles.backends.training_utils.metrics import train_dump
 from miles.backends.training_utils.parallel import get_parallel_state, set_parallel_state
@@ -201,6 +202,9 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
                     transformers, native_cls_name
                 )  # config-access-exempt: attribute selected at runtime from native_cls_name
             return AutoModelForCausalLM
+
+    def _rollout_quantization_config(self) -> dict | None:
+        return rollout_quantization_config(self.args)
 
     def _load_hf_model(self, checkpoint_path: str, *, keep_fp32_master: bool) -> torch.nn.Module:
         """Build the HF model and apply the architecture's corrections; shared by the actor and ref model."""
