@@ -342,8 +342,14 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         """No-grad forward. Logits stay in native bf16; the loss path upcasts
         per-response chunks, which avoids a full-vocab fp32 tensor."""
         model_args = self._get_model_inputs_args(batch)
-        with precision_forward_context(self.precision_policy):
+        with self._copy_in_context(model), precision_forward_context(self.precision_policy):
             return model(**model_args).logits
+
+    def _copy_in_context(self, model: torch.nn.Module):
+        # Under true-on-policy FSDP's all-gather copy-in runs on the compute stream during forwards. On its
+        # own stream, a forward after the train state was offloaded and reloaded sometimes came out wrong
+        # on one rank. The backward keeps the overlap.
+        return _fsdp_copy_in_on_current_stream(model) if self.args.true_on_policy_mode else nullcontext()
 
     def _step_runner(self) -> LinearStepRunner:
         return LinearStepRunner(self._forward, self._zero_grad, self._apply_step)
@@ -374,7 +380,7 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         model_args = self._get_model_inputs_args(batch)
         replaying = routing_replay_manager.stage == routing_replay.REPLAY_BACKWARD
         replay_stage = routing_replay.stage(routing_replay.REPLAY_FORWARD) if replaying else nullcontext()
-        with replay_stage, precision_forward_context(self.precision_policy):
+        with replay_stage, self._copy_in_context(self.model), precision_forward_context(self.precision_policy):
             return self.model(**model_args).logits
 
     def _zero_grad(self) -> None:
@@ -449,6 +455,20 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
             model_args.update(batch["multimodal_train_inputs"])
 
         return model_args
+
+
+@contextmanager
+def _fsdp_copy_in_on_current_stream(model: torch.nn.Module):
+    """Run FSDP2's all-gather copy-in on the current stream; the all-gather keeps its own stream."""
+    state = model._get_fsdp_state()
+    state._lazy_init()
+    comm = state._comm_ctx
+    saved = comm.all_gather_copy_in_stream
+    comm.all_gather_copy_in_stream = torch.cuda.current_stream()
+    try:
+        yield
+    finally:
+        comm.all_gather_copy_in_stream = saved
 
 
 @torch.no_grad()
