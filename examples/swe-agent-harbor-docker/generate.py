@@ -20,7 +20,8 @@ Components:
 import logging
 
 from miles.rollout.base_types import RolloutFnTrainInput, RolloutFnTrainOutput
-from miles.rollout.filter_hub.base_types import iter_samples
+from miles.rollout.filter_hub.base_types import FilterOutput, iter_samples
+from miles.rollout.filter_hub.common_filters import apply_aborted_filter
 from miles.rollout.inference_rollout.inference_rollout_common import InferenceRolloutFn
 from miles.utils.types import Sample
 
@@ -39,6 +40,26 @@ async def reward_func(args, samples: Sample | list[Sample], **kwargs) -> float |
     if isinstance(samples, list):
         return [s.metadata.get("reward", 0.0) for s in samples]
     return samples.metadata.get("reward", 0.0)
+
+
+# -- Dynamic filter --
+
+# exit statuses that say the trial produced no grade (agent servers that report them)
+_NO_GRADE_EXIT_STATUSES = ("infra_error", "cancelled")
+
+
+def check_no_aborted_or_infra_error(args, samples, **kwargs) -> FilterOutput:
+    """``check_no_aborted``, and also drop a group if any sample has no real grade: the agent
+    server reported an infrastructure failure, or the agent-server call itself failed (no
+    ``exit_status`` merged into the metadata). Such samples would otherwise train as reward 0."""
+    out = apply_aborted_filter(args, samples, **kwargs)
+    if not out.keep:
+        return out
+    for sample in iter_samples(samples):
+        status = sample.metadata.get("exit_status")
+        if status is None or status in _NO_GRADE_EXIT_STATUSES:
+            return FilterOutput(keep=False, reason="group_has_infra_error")
+    return FilterOutput(keep=True)
 
 
 # -- Agent Metrics Aggregation --
