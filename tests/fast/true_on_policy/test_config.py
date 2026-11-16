@@ -258,3 +258,43 @@ def test_off_policy_builds_empty_launch_plan_and_does_not_mutate_args():
     assert not plan.enabled
     assert plan.train_args == ""
     assert plan.env_vars == {}
+
+
+def test_dense_blackwell_contract_uses_the_samplers_logprobs_and_fa4():
+    plan = build_true_on_policy_launch_plan(
+        _args(
+            model_name="Qwen3-4B-Instruct-2507",
+            train_backend="fsdp",
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            true_on_policy_contract="qwen3_dense_blackwell_true_on_policy_v1",
+        )
+    )
+
+    assert plan.contract.logprob_contract == "sglang_decode"
+    assert "--sglang-true-on-policy-contract qwen3_dense_blackwell_true_on_policy_v1" in plan.train_args
+    assert "--sglang-attention-backend fa4" in plan.train_args
+    assert "--attn-implementation fa4" in plan.train_args
+    assert "--use-rollout-logprobs" in plan.train_args
+    assert "--recompute-logprobs-via-prefill" not in plan.train_args
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"train_backend": "megatron"},
+        {"tensor_model_parallel_size": 2},
+        {"context_parallel_size": 2},
+        {"rollout_num_gpus_per_engine": 2},
+    ],
+)
+def test_dense_blackwell_contract_rejects_megatron_and_model_parallel_layouts(overrides):
+    values = {
+        "train_backend": "fsdp",
+        "tensor_model_parallel_size": 1,
+        "context_parallel_size": 1,
+        "true_on_policy_contract": "qwen3_dense_blackwell_true_on_policy_v1",
+    }
+    values.update(overrides)
+    with pytest.raises(ValueError, match="qwen3_dense_blackwell_true_on_policy_v1"):
+        build_true_on_policy_launch_plan(_args(**values))

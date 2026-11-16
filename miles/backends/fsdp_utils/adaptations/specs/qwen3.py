@@ -6,13 +6,17 @@ from dataclasses import replace
 import torch
 
 from miles.backends.fsdp_utils.adaptations.arch_adapter import ArchAdapter
-from miles.true_on_policy.contracts import QWEN3_DENSE_TRUE_ON_POLICY_V1
+from miles.true_on_policy.contracts import QWEN3_DENSE_BLACKWELL_TRUE_ON_POLICY_V1, QWEN3_DENSE_TRUE_ON_POLICY_V1
+
+# the Hopper and Blackwell dense contracts share the precision contract and model math below; they
+# differ in attention
+_DENSE_CONTRACTS = (QWEN3_DENSE_TRUE_ON_POLICY_V1.name, QWEN3_DENSE_BLACKWELL_TRUE_ON_POLICY_V1.name)
 
 
 def _uses_formal_contract(args) -> bool:
     return (
         args.true_on_policy_mode
-        and args.sglang.common_value("true_on_policy_contract") == QWEN3_DENSE_TRUE_ON_POLICY_V1.name
+        and args.sglang.common_value("true_on_policy_contract") in _DENSE_CONTRACTS
     )
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .schema import (
+    QWEN3_DENSE_BLACKWELL_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_DENSE_TRUE_ON_POLICY_V1_SCHEMA,
     KernelContract,
     LogprobContract,
@@ -72,8 +73,14 @@ QWEN3_DENSE_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
 )
 
 
+QWEN3_DENSE_BLACKWELL_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
+    schema=QWEN3_DENSE_BLACKWELL_TRUE_ON_POLICY_V1_SCHEMA,
+)
+
+
 _CONTRACT_BY_NAME = {
     QWEN3_DENSE_TRUE_ON_POLICY_V1.name: QWEN3_DENSE_TRUE_ON_POLICY_V1,
+    QWEN3_DENSE_BLACKWELL_TRUE_ON_POLICY_V1.name: QWEN3_DENSE_BLACKWELL_TRUE_ON_POLICY_V1,
 }
 
 
