@@ -1,16 +1,20 @@
 """Qwen3 dense: the formal true-on-policy precision contract (fp32 params under bf16 autocast, selected
-params synced at fp32) and its final-norm rounding order."""
+params synced at fp32), its final-norm rounding order, and the quantized linears of the quantized
+contracts."""
 
+import logging
 from dataclasses import replace
 
 import torch
 
 from miles.backends.fsdp_utils.adaptations.arch_adapter import ArchAdapter
-from miles.true_on_policy.contracts import QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1, QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1
+from miles.true_on_policy.contracts import all_true_on_policy_contracts, get_true_on_policy_contract
 
-# the Hopper and Blackwell dense contracts share the precision contract and model math below; they
-# differ in attention
-_DENSE_CONTRACTS = (QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1.name, QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1.name)
+logger = logging.getLogger(__name__)
+
+# the Qwen3 dense contracts share the precision contract and model math below; they differ in attention
+# (Hopper / Blackwell) and in the linear layers (bf16 / quantized)
+_DENSE_CONTRACTS = frozenset(c.name for c in all_true_on_policy_contracts() if c.model_family == "qwen3_dense")
 
 
 def _uses_formal_contract(args) -> bool:
@@ -46,6 +50,13 @@ class Qwen3Adapter(ArchAdapter):
     def patch_model(self, model, args):
         if not _uses_formal_contract(args) or args.backend.fp16:
             return
-        from miles.backends.fsdp_utils.models.qwen3 import apply_qwen3_dense_true_on_policy_patch
+        from miles.backends.fsdp_utils.models.qwen3 import (
+            apply_qwen3_dense_linear_quant,
+            apply_qwen3_dense_true_on_policy_patch,
+        )
 
         apply_qwen3_dense_true_on_policy_patch(model)
+        contract = get_true_on_policy_contract(args.sglang.common_value("true_on_policy_contract"))
+        if contract.linear_quant is not None:
+            n = apply_qwen3_dense_linear_quant(model, contract.linear_quant)
+            logger.warning(f"Qwen3 dense: {n} projections run the {contract.linear_quant} W+A kernels ({contract.name})")

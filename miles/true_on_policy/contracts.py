@@ -3,9 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .schema import (
+    QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1_SCHEMA,
+    QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1_SCHEMA,
+    QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1_SCHEMA,
     KernelContract,
+    LinearQuant,
     LogprobContract,
     ModelFamily,
     TrueOnPolicyContractName,
@@ -44,6 +48,10 @@ class TrueOnPolicyContract:
         return self.schema.fsdp_attention_implementation
 
     @property
+    def linear_quant(self) -> LinearQuant | None:
+        return self.schema.linear_quant
+
+    @property
     def disable_megatron_sequence_parallel(self) -> bool:
         return self.schema.disable_megatron_sequence_parallel
 
@@ -78,9 +86,26 @@ QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
 )
 
 
+QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
+    schema=QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1_SCHEMA,
+)
+QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
+    schema=QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1_SCHEMA,
+)
+QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
+    schema=QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA,
+)
+
+
 _CONTRACT_BY_NAME = {
-    QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1.name: QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1,
-    QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1.name: QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1,
+    contract.name: contract
+    for contract in (
+        QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1,
+        QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1,
+        QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1,
+        QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1,
+        QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1,
+    )
 }
 
 

@@ -1,15 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal
 
 
-TrueOnPolicyContractName = Literal["qwen3_dense_hopper_bf16_true_on_policy_v1", "qwen3_dense_blackwell_bf16_true_on_policy_v1"]
+TrueOnPolicyContractName = Literal[
+    "qwen3_dense_hopper_bf16_true_on_policy_v1",
+    "qwen3_dense_blackwell_bf16_true_on_policy_v1",
+    "qwen3_dense_blackwell_mxfp8_true_on_policy_v1",
+    "qwen3_dense_blackwell_mxfp4_true_on_policy_v1",
+    "qwen3_dense_blackwell_nvfp4_true_on_policy_v1",
+]
 ModelFamily = Literal["qwen3_dense", "qwen3_moe", "qwen3_next"]
 KernelContract = Literal["qwen3_dense_sglang_math"]
 # Where the rollout logprobs the trainer must match come from: an SGLang prefill that re-scores each
 # finished rollout, or the decode pass that sampled it (the sampler itself).
 LogprobContract = Literal["sglang_prefill", "sglang_decode"]
+# W+A quantization of the linear layers, run identically by the trainer and the sampler
+# (miles/kernels/quant/mx_linear.py)
+LinearQuant = Literal["mxfp8", "mxfp4", "nvfp4"]
 
 
 @dataclass(frozen=True)
@@ -23,6 +32,8 @@ class TrueOnPolicyContractSchema:
     sglang_attention_backend: str
     fsdp_attention_implementation: str
     disable_megatron_sequence_parallel: bool
+    # None: bf16 linear layers
+    linear_quant: LinearQuant | None = None
 
 
 # Qwen3 dense on Hopper (SM90), FlashAttention-3 on both sides. The trainer matches an SGLang prefill
@@ -50,4 +61,17 @@ QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA = TrueOnPolicyContractSchema
     sglang_attention_backend="fa4",
     fsdp_attention_implementation="fa4",
     disable_megatron_sequence_parallel=True,
+)
+
+
+# Qwen3 dense on Blackwell with W+A quantized linear layers: all seven projections of every decoder layer
+# (q, k, v, o, gate, up, down) in one format, on both sides; otherwise the Blackwell contract above.
+QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1_SCHEMA = replace(
+    QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA, name="qwen3_dense_blackwell_mxfp8_true_on_policy_v1", linear_quant="mxfp8"
+)
+QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1_SCHEMA = replace(
+    QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA, name="qwen3_dense_blackwell_mxfp4_true_on_policy_v1", linear_quant="mxfp4"
+)
+QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA = replace(
+    QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA, name="qwen3_dense_blackwell_nvfp4_true_on_policy_v1", linear_quant="nvfp4"
 )

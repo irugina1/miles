@@ -9,6 +9,9 @@ from .config import (
     build_true_on_policy_launch_plan,
 )
 from .contracts import (
+    QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1,
+    QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1,
+    QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1,
     QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1,
     QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1,
     TrueOnPolicyContract,
@@ -23,6 +26,9 @@ __all__ = [
     "TrueOnPolicyContract",
     "TrueOnPolicyModelProfile",
     "TrueOnPolicyParallelLayout",
+    "QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1",
+    "QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1",
+    "QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1",
     "QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1",
     "QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1",
     "apply_true_on_policy_script_defaults",

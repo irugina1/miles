@@ -298,3 +298,22 @@ def test_dense_blackwell_contract_rejects_megatron_and_model_parallel_layouts(ov
     values.update(overrides)
     with pytest.raises(ValueError, match="qwen3_dense_blackwell_bf16_true_on_policy_v1"):
         build_true_on_policy_launch_plan(_args(**values))
+
+
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+def test_quantized_blackwell_contract_reaches_sglang_by_name(fmt):
+    name = f"qwen3_dense_blackwell_{fmt}_true_on_policy_v1"
+    plan = build_true_on_policy_launch_plan(
+        _args(
+            model_name="Qwen3-4B",
+            train_backend="fsdp",
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            true_on_policy_contract=name,
+        )
+    )
+
+    assert plan.contract.linear_quant == fmt
+    assert f"--sglang-true-on-policy-contract {name}" in plan.train_args
+    assert "--attn-implementation fa4" in plan.train_args
+    assert "--use-rollout-logprobs" in plan.train_args
