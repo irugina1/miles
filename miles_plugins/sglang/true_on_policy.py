@@ -96,7 +96,7 @@ def _mx_linear_apply(original, self, layer, x, bias=None, *args, **kwargs):
     from miles.kernels.quant.mx_linear import mx_linear_inference
 
     assert bias is None and not args and not kwargs, (bias, args, kwargs)
-    return mx_linear_inference(x, cached)
+    return mx_linear_inference(x, cached, _linear_quant())
 
 
 def register() -> None:

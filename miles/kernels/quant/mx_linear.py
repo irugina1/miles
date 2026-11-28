@@ -13,6 +13,11 @@ kernels batch-invariant, so a token's result does not depend on the rest of the 
 Element rounding is round-to-nearest-even. MX block scales are ``2^ceil(log2(amax / elem_max))``
 (the block's largest element is never clipped); NVFP4 block scales are e4m3 ``amax / 6 / global``.
 
+``nvfp4_4over6`` adds Four Over Six (arXiv 2512.02010) to the activations, as Thinking Machines' 4-bit
+recipe does; weights stay plain NVFP4. Each block is quantized with its max mapped to 6 and to 4 and
+keeps the lower squared error (ties: 6; miles' TE path defaults to absolute error). The per-token scale
+is ``amax / (256 * 6)``, so the 4-scale (1.5x) fits e4m3. Only the scale bytes differ from NVFP4.
+
 The backward is not quantized: bf16 GEMMs with fp32 outputs on exactly the values the forward multiplied,
 straight through to the master weights. Element x block scale is exact in bf16; nvfp4's fp32 second-level
 scales are applied outside the GEMMs.
@@ -29,13 +34,21 @@ import torch
 import triton
 import triton.language as tl
 
-FORMATS = ("mxfp4", "nvfp4", "mxfp8")
+FORMATS = ("mxfp4", "nvfp4", "mxfp8")  # MXTensor.fmt
+LINEAR_FORMATS = (*FORMATS, "nvfp4_4over6")  # what a layer runs; 4/6 is stored as nvfp4
 
 
 _GROUP = {"mxfp8": 32, "mxfp4": 32, "nvfp4": 16}
 _PACK = {"mxfp8": 1, "mxfp4": 2, "nvfp4": 2}  # elements per stored byte
 _DOT_FORMAT = {"mxfp8": "e4m3", "mxfp4": "e2m1", "nvfp4": "e2m1"}
 NVFP4_GLOBAL_DIV = 448.0 * 6.0  # second-level scale = amax / (e4m3 max * e2m1 max)
+NVFP4_4OVER6_GLOBAL_DIV = 256.0 * 6.0  # room for the 4-scale: 256 * 1.5 = 384 <= 448
+
+
+def storage_format(fmt: str) -> str:
+    assert fmt in LINEAR_FORMATS, fmt
+    return "nvfp4" if fmt == "nvfp4_4over6" else fmt
+
 
 # One fixed GEMM configuration. BLOCK_M (the MMA instruction's M) and BLOCK_K (the K chunk of each
 # dot_scaled) fix every output's accumulation order: changing either changes the numerics on both sides at
@@ -43,7 +56,7 @@ NVFP4_GLOBAL_DIV = 448.0 * 6.0  # second-level scale = amax / (e4m3 max * e2m1 m
 # sizes, where the grid is a single row of programs.
 BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
 _NUM_WARPS, _NUM_STAGES = 4, 3
-# Blocks per quantizer program; bitwise-neutral (each block is quantized on its own).
+# Blocks per quantizer program. It orders 4/6's error sums, so it is part of that contract.
 _QUANT_BLOCKS = 64
 
 
@@ -80,6 +93,26 @@ def _e2m1_code(y):
 
 
 @triton.jit
+def _e2m1_value(code):
+    """The e2m1 value of a 4-bit code: +-{0, 0.5, 1, 1.5, 2, 3, 4, 6}."""
+    m = (code & 7).to(tl.float32)
+    v = tl.where(m < 4.0, m * 0.5, tl.where(m < 6.0, m - 2.0, (m - 4.0) * 2.0))
+    return tl.where(code >= 8, -v, v)
+
+
+@triton.jit
+def _nvfp4_4over6_candidate(x, scale, g):
+    """[GB, 16] blocks at block scales ``scale`` -> (e4m3 scales, codes, squared errors). IEEE division by
+    a per-block reciprocal, as the reference implementation does."""
+    bs8 = tl.minimum(scale, 448.0).to(tl.float8e4nv)
+    d = bs8.to(tl.float32) * g
+    y = x * tl.where(d > 0, tl.div_rn(1.0, d), 0.0)[:, None]
+    code = _e2m1_code(tl.minimum(tl.maximum(y, -6.0), 6.0))
+    diff = _e2m1_value(code) * d[:, None] - x
+    return bs8, code, tl.sum(diff * diff, axis=1)
+
+
+@triton.jit
 def _quantize_rows_kernel(
     X,
     Q,
@@ -90,6 +123,7 @@ def _quantize_rows_kernel(
     stride_s,
     NG,  # groups per row
     FMT: tl.constexpr,  # 0 mxfp4, 1 nvfp4, 2 mxfp8 (FORMATS order)
+    FOUR_OVER_SIX: tl.constexpr,  # nvfp4 only
     GROUP: tl.constexpr,
     GB: tl.constexpr,  # groups per program (power of two)
 ):
@@ -103,12 +137,20 @@ def _quantize_rows_kernel(
     if FMT == 1:
         # nvfp4: e4m3 block scale relative to the row's fp32 second-level scale
         g = tl.load(G + row)
-        bs = amax / 6.0 / tl.where(g > 0, g, 1.0)
-        bs8 = tl.minimum(bs, 448.0).to(tl.float8e4nv)
-        denom = bs8.to(tl.float32) * g
-        y = x / tl.where(denom > 0, denom, 1.0)[:, None]
-        y = tl.where(denom[:, None] > 0, y, 0.0)
-        code = _e2m1_code(tl.minimum(tl.maximum(y, -6.0), 6.0))
+        if FOUR_OVER_SIX:
+            scale6 = tl.div_rn(tl.div_rn(amax, 6.0), tl.where(g > 0, g, 1.0))
+            bs8, code, err6 = _nvfp4_4over6_candidate(x, scale6, g)
+            bs8_4, code_4, err4 = _nvfp4_4over6_candidate(x, scale6 * 1.5, g)
+            take4 = err4 < err6
+            bs8 = tl.where(take4, bs8_4, bs8)
+            code = tl.where(take4[:, None], code_4, code)
+        else:
+            bs = amax / 6.0 / tl.where(g > 0, g, 1.0)
+            bs8 = tl.minimum(bs, 448.0).to(tl.float8e4nv)
+            denom = bs8.to(tl.float32) * g
+            y = x / tl.where(denom > 0, denom, 1.0)[:, None]
+            y = tl.where(denom[:, None] > 0, y, 0.0)
+            code = _e2m1_code(tl.minimum(tl.maximum(y, -6.0), 6.0))
         tl.store(S + row * stride_s + gid, bs8, mask=gmask)
     else:
         # e8m0 scale 2^e with e = ceil(log2(amax / elem_max)), computed exactly from the bits
@@ -137,12 +179,13 @@ def _quantize_rows_kernel(
 # below reproduces ``amax.float() / NVFP4_GLOBAL_DIV`` exactly that way. The dtype is explicit: SGLang
 # imports this module while loading a model, under a bf16 default dtype.
 _NVFP4_GLOBAL_INV = float(torch.tensor(1.0, dtype=torch.float32) / NVFP4_GLOBAL_DIV)
+_NVFP4_4OVER6_GLOBAL_INV = float(torch.tensor(1.0, dtype=torch.float32) / NVFP4_4OVER6_GLOBAL_DIV)
 
 
 @triton.jit
 def _row_global_scale_kernel(X, G, stride_x, K, INV, BLOCK: tl.constexpr):
-    """nvfp4's per-row second-level scale, max|x| / (448 * 6), in one launch: the max is exact and INV is
-    the fp32 reciprocal, so it equals ``x.abs().amax(1).float() / NVFP4_GLOBAL_DIV`` bitwise."""
+    """nvfp4's per-row second-level scale in one launch; bitwise ``x.abs().amax(1).float() / DIV`` (the max
+    is exact and INV is DIV's fp32 reciprocal)."""
     row = tl.program_id(0).to(tl.int64)
     amax = tl.zeros((BLOCK,), dtype=tl.float32)
     for k0 in range(0, K, BLOCK):
@@ -159,9 +202,11 @@ def quantize_rows(
     out: MXTensor | None = None,
 ) -> MXTensor:
     """Quantize each row of a bf16 [R, K] tensor. ``global_scale`` ([R] fp32) is nvfp4's second level;
-    when omitted it is each row's own amax / (448 * 6). With ``out`` the result is written into its
-    buffers (an in-place refresh that keeps captured CUDA graphs valid)."""
-    assert fmt in FORMATS, fmt
+    when omitted it is each row's amax / NVFP4_GLOBAL_DIV (or NVFP4_4OVER6_GLOBAL_DIV). With ``out`` the
+    result is written into its buffers (an in-place refresh that keeps captured CUDA graphs valid)."""
+    four_over_six = fmt == "nvfp4_4over6"
+    assert not (four_over_six and global_scale is not None), "4/6 sets its own second-level scale"
+    fmt = storage_format(fmt)
     assert x.dim() == 2 and x.is_cuda and x.dtype == torch.bfloat16, (x.shape, x.dtype)
     x = x.contiguous()
     rows, k = x.shape
@@ -179,8 +224,9 @@ def quantize_rows(
     assert out.fmt == fmt and out.data.shape == (rows, k // pack), (out.fmt, out.data.shape, x.shape)
     if global_scale is not None:
         out.global_scale.copy_(global_scale)
-    elif fmt == "nvfp4" and rows:  # each row's own amax / (448 * 6), straight into the buffer
-        _row_global_scale_kernel[(rows,)](x, out.global_scale, x.stride(0), k, _NVFP4_GLOBAL_INV, BLOCK=1024, num_warps=4)
+    elif fmt == "nvfp4" and rows:
+        inv = _NVFP4_4OVER6_GLOBAL_INV if four_over_six else _NVFP4_GLOBAL_INV
+        _row_global_scale_kernel[(rows,)](x, out.global_scale, x.stride(0), k, inv, BLOCK=1024, num_warps=4)
     if rows:
         num_groups, groups_per_program = k // group, _QUANT_BLOCKS
         _quantize_rows_kernel[(rows, triton.cdiv(num_groups, groups_per_program))](
@@ -193,6 +239,7 @@ def quantize_rows(
             out.scale.stride(0),
             num_groups,
             FMT=FORMATS.index(fmt),
+            FOUR_OVER_SIX=four_over_six,
             GROUP=group,
             GB=groups_per_program,
             num_warps=4,
@@ -206,9 +253,9 @@ def quantize_weight(
     shard_sizes: tuple[int, ...] | None = None,
     out: MXTensor | None = None,
 ) -> MXTensor:
-    """Quantize a bf16 [N, K] weight along K. For nvfp4 each shard (rows of one HF weight inside a
-    merged SGLang weight; the whole weight by default) gets its own second-level scale, so a merged
-    weight quantizes exactly as its parts do."""
+    """Quantize a bf16 [N, K] weight along K (nvfp4_4over6: plain nvfp4). For nvfp4 each shard (rows of one HF weight inside a merged SGLang weight; the whole weight by default) gets its own
+    second-level scale, so a merged weight quantizes exactly as its parts do."""
+    fmt = storage_format(fmt)
     with torch.no_grad():
         weight = weight.detach()
         global_scale = None
@@ -365,11 +412,12 @@ def mx_gemm(a: MXTensor, w: MXTensor) -> torch.Tensor:
 # --------------------------------------------------------------------------------------------
 
 
-def mx_linear_inference(x: torch.Tensor, w: MXTensor) -> torch.Tensor:
-    """The SGLang side: bf16 [..., K] -> bf16 [..., N] with ``w`` already quantized."""
+def mx_linear_inference(x: torch.Tensor, w: MXTensor, fmt: str) -> torch.Tensor:
+    """The SGLang side: bf16 [..., K] -> bf16 [..., N]; ``w`` comes from ``quantize_weight(..., fmt)``."""
+    assert w.fmt == storage_format(fmt), (w.fmt, fmt)
     lead = x.shape[:-1]
     x2 = x.reshape(-1, x.shape[-1]).to(torch.bfloat16)
-    return mx_gemm(quantize_rows(x2, w.fmt), w).view(*lead, -1)
+    return mx_gemm(quantize_rows(x2, fmt), w).view(*lead, -1)
 
 
 class MXLinearFunction(torch.autograd.Function):
@@ -392,7 +440,7 @@ class MXLinearFunction(torch.autograd.Function):
     def backward(ctx, grad_out: torch.Tensor):
         weight, qx_data, qx_scale, *qx_global = ctx.saved_tensors
         fmt = ctx.fmt
-        qx = MXTensor(fmt, qx_data, qx_scale, qx_global[0] if qx_global else None)
+        qx = MXTensor(storage_format(fmt), qx_data, qx_scale, qx_global[0] if qx_global else None)
         qw = quantize_weight(weight.to(torch.bfloat16), fmt)
         g = grad_out.reshape(-1, grad_out.shape[-1]).to(torch.bfloat16)
         w_q, x_q = dequantize(qw, with_global=False), dequantize(qx, with_global=False)
@@ -416,6 +464,7 @@ class MXLinear(torch.nn.Linear):
 
 
 def swap_to_mx_linear(linear: torch.nn.Linear, fmt: str) -> None:
+    assert fmt in LINEAR_FORMATS, fmt
     if linear.bias is not None:
         raise ValueError("MXLinear supports bias-free linears only")
     linear.__class__ = MXLinear

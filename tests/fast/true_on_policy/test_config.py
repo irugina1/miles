@@ -300,7 +300,7 @@ def test_dense_blackwell_contract_rejects_megatron_and_model_parallel_layouts(ov
         build_true_on_policy_launch_plan(_args(**values))
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4", "nvfp4_4over6"])
 def test_quantized_blackwell_contract_reaches_sglang_by_name(fmt):
     name = f"qwen3_dense_blackwell_{fmt}_true_on_policy_v1"
     plan = build_true_on_policy_launch_plan(

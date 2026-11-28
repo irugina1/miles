@@ -13,7 +13,7 @@ pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10, reason="needs SM100"
 )
 
-FORMATS = ("mxfp4", "nvfp4", "mxfp8")
+FORMATS = ("mxfp4", "nvfp4", "mxfp8", "nvfp4_4over6")
 HIDDEN, Q, KV, INTER = 2560, 4096, 1024, 9728  # Qwen3-4B
 
 
@@ -37,11 +37,11 @@ def test_token_result_does_not_depend_on_batch(fmt):
     (w,) = _weights([KV], HIDDEN)
     qw = quantize_weight(w.to(torch.bfloat16), fmt)
     x = _activations(1000, HIDDEN)
-    full = mx_linear_inference(x, qw)
+    full = mx_linear_inference(x, qw, fmt)
     for rows in (slice(0, 1), slice(5, 6), slice(3, 130), slice(127, 129), slice(900, 1000)):
-        assert torch.equal(mx_linear_inference(x[rows], qw), full[rows]), rows
+        assert torch.equal(mx_linear_inference(x[rows], qw, fmt), full[rows]), rows
     perm = torch.randperm(1000, device="cuda")
-    assert torch.equal(mx_linear_inference(x[perm], qw), full[perm])
+    assert torch.equal(mx_linear_inference(x[perm], qw, fmt), full[perm])
 
 
 @pytest.mark.parametrize("fmt", FORMATS)
@@ -51,8 +51,8 @@ def test_merged_projection_equals_separate_ones(fmt, sizes, k):
 
     parts = [w.to(torch.bfloat16) for w in _weights(sizes, k)]
     x = _activations(300, k)
-    merged = mx_linear_inference(x, quantize_weight(torch.cat(parts), fmt, shard_sizes=sizes))
-    separate = torch.cat([mx_linear_inference(x, quantize_weight(w, fmt)) for w in parts], dim=-1)
+    merged = mx_linear_inference(x, quantize_weight(torch.cat(parts), fmt, shard_sizes=sizes), fmt)
+    separate = torch.cat([mx_linear_inference(x, quantize_weight(w, fmt), fmt) for w in parts], dim=-1)
     assert torch.equal(merged, separate)
 
 
@@ -67,12 +67,12 @@ def test_trainer_forward_is_bitwise_sglang(fmt, k, n):
     x32 = _activations(517, k).float() + 1e-3  # fp32 input, as the true-on-policy norms emit
     with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
         trained = MXLinearFunction.apply(x32[None], w32.requires_grad_(), fmt)[0]
-    sampled = mx_linear_inference(x32.to(torch.bfloat16), quantize_weight(w32.detach().to(torch.bfloat16), fmt))
+    sampled = mx_linear_inference(x32.to(torch.bfloat16), quantize_weight(w32.detach().to(torch.bfloat16), fmt), fmt)
     assert trained.dtype == sampled.dtype == torch.bfloat16
     assert torch.equal(trained, sampled)
 
 
-@pytest.mark.parametrize("fmt,tol", [("mxfp4", 1e-2), ("nvfp4", 1e-2), ("mxfp8", 1e-2)])
+@pytest.mark.parametrize("fmt,tol", [("mxfp4", 1e-2), ("nvfp4", 1e-2), ("mxfp8", 1e-2), ("nvfp4_4over6", 1e-2)])
 def test_gemm_matches_dequantized_reference(fmt, tol):
     from miles.kernels.quant.mx_linear import dequantize, mx_gemm, quantize_rows, quantize_weight
 
@@ -84,7 +84,7 @@ def test_gemm_matches_dequantized_reference(fmt, tol):
     assert ((out - ref).norm() / ref.norm()).item() < tol
     # and the quantization itself is roughly right
     rel = lambda a, b: ((a - b).norm() / b.norm()).item()  # noqa: E731
-    expected = {"mxfp4": 0.2, "nvfp4": 0.15, "mxfp8": 0.05}[fmt]
+    expected = {"mxfp4": 0.2, "nvfp4": 0.15, "mxfp8": 0.05}[qw.fmt]
     assert rel(dequantize(qw, torch.float32), w.to(torch.bfloat16).float()) < expected
 
 
@@ -114,6 +114,7 @@ def test_nvfp4_scale_constant_does_not_depend_on_the_default_dtype():
     finally:
         torch.set_default_dtype(previous)
     assert reloaded._NVFP4_GLOBAL_INV == expected
+    assert reloaded._NVFP4_4OVER6_GLOBAL_INV == float(torch.tensor(1.0, dtype=torch.float32) / mx.NVFP4_4OVER6_GLOBAL_DIV)
     importlib.reload(mx)
 
 
@@ -168,3 +169,96 @@ def test_backward_operands_are_exactly_the_forward_values(fmt):
     qw = quantize_weight(w.to(torch.bfloat16), fmt)
     if qw.global_scale is not None:  # one per trainer weight, as the backward assumes
         assert (qw.global_scale == qw.global_scale[0]).all()
+
+
+# --------------------------------------------------------------------------------------------
+# Four Over Six (nvfp4_4over6)
+# --------------------------------------------------------------------------------------------
+
+
+def _fouroversix_reference(x: torch.Tensor):
+    """mit-han-lab/fouroversix's quantizer (quantize/pytorch/reference.py; ScaleRule.mse,
+    RoundStyle.nearest) with a per-row amax. Returns element x block scale and the blocks that took 4."""
+    xf = x.float()
+    amax = xf.abs().amax(dim=1)[:, None, None]
+    blocks = xf.view(xf.shape[0], -1, 16)
+    six, top = torch.tensor(6.0, device=x.device), torch.tensor(6.0 * 256.0, device=x.device)
+    encode = torch.where(amax > 0, top / amax, 0.0)
+    decode = torch.where(amax > 0, 1 / encode, 0.0)
+
+    def fake_e2m1(y):
+        a = y.abs()
+        q = torch.where(a < 2, torch.round(2 * a) / 2, torch.where(a < 4, torch.round(a), 2 * torch.round(a / 2)))
+        return y.sign() * q.clamp(max=6.0)
+
+    def candidate(expansion):
+        bs8 = (blocks.abs().amax(dim=-1, keepdim=True) / six * encode * expansion).to(torch.float8_e4m3fn).float()
+        scaled = torch.where(bs8 != 0, blocks * (1 / (decode * bs8)), 0.0)
+        fake = fake_e2m1(scaled)
+        return fake * bs8, ((fake * bs8 * amax / top - blocks) ** 2).sum(dim=-1)
+
+    (v6, err6), (v4, err4) = candidate(1.0), candidate(1.5)
+    take4 = err4 < err6
+    return torch.where(take4[..., None], v4, v6).view_as(xf), take4
+
+
+def test_four_over_six_matches_the_reference_quantizer():
+    """Same scales and codes except at e4m3 rounding ties (the scale is formed in a different fp32 order),
+    where neither is better overall."""
+    from miles.kernels.quant.mx_linear import dequantize, quantize_rows
+
+    x = _activations(1024, HIDDEN)
+    x[7] = 0
+    q = quantize_rows(x, "nvfp4_4over6")
+    got = dequantize(q, torch.float32, with_global=False)
+    ref, take4 = _fouroversix_reference(x)
+    assert take4.float().mean().item() > 0.05 and (~take4).float().mean().item() > 0.05  # both scales in use
+    differ = (got != ref).view(x.shape[0], -1, 16).any(dim=-1)
+    assert differ.float().mean().item() < 5e-3, differ.sum().item()
+    total_err = lambda v, g: ((v * g[:, None] - x.float()) ** 2).sum().item()  # noqa: E731
+    ref_g = x.float().abs().amax(dim=1) / (256.0 * 6.0)
+    assert abs(total_err(got, q.global_scale) / total_err(ref, ref_g) - 1) < 1e-3
+
+
+def test_four_over_six_lowers_the_activation_error():
+    from miles.kernels.quant.mx_linear import dequantize, quantize_rows
+
+    x = _activations(1024, HIDDEN)
+    err = lambda fmt: ((dequantize(quantize_rows(x, fmt), torch.float32) - x.float()) ** 2).sum().item()  # noqa: E731
+    assert err("nvfp4_4over6") < 0.95 * err("nvfp4")
+
+
+def test_four_over_six_numerics_are_pinned():
+    """Blocks per program orders 4/6's error sums: changing it changes the contract's bits."""
+    import miles.kernels.quant.mx_linear as mx
+
+    assert mx._QUANT_BLOCKS == 64
+
+
+def test_four_over_six_zero_blocks_in_a_tiny_row():
+    """Zero blocks stay zero when the row's scale is tiny but nonzero."""
+    from miles.kernels.quant.mx_linear import dequantize, quantize_rows
+
+    x = torch.zeros(2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+    x[0, :4] = 1e-37
+    x[1, :4] = 1.0
+    q = quantize_rows(x, "nvfp4_4over6")
+    assert not q.scale.float().isnan().any()
+    assert torch.equal(dequantize(q, torch.float32)[:, 16:], torch.zeros(2, HIDDEN - 16, device="cuda"))
+
+
+def test_four_over_six_activation_scale_and_plain_nvfp4_weights():
+    """Activations: scale amax / (256 * 6). Weights: plain nvfp4."""
+    from miles.kernels.quant.mx_linear import NVFP4_4OVER6_GLOBAL_DIV, quantize_rows, quantize_weight
+
+    x = _activations(257, HIDDEN)
+    x[5] = 0
+    q = quantize_rows(x, "nvfp4_4over6")
+    assert q.fmt == "nvfp4"
+    assert torch.equal(q.global_scale, x.abs().amax(dim=1).float() / NVFP4_4OVER6_GLOBAL_DIV)
+    (w,) = _weights([KV], HIDDEN)
+    w = w.to(torch.bfloat16)
+    a, b = quantize_weight(w, "nvfp4_4over6"), quantize_weight(w, "nvfp4")
+    assert a.fmt == b.fmt == "nvfp4"
+    assert torch.equal(a.data, b.data) and torch.equal(a.scale.view(torch.uint8), b.scale.view(torch.uint8))
+    assert torch.equal(a.global_scale, b.global_scale)

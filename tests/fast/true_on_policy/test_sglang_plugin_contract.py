@@ -19,7 +19,7 @@ def test_plugin_registers_every_miles_contract_with_sglang_runtime_policy():
         assert registered == replace(sglang_own, contract_name=contract.name)
 
 
-@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4"])
+@pytest.mark.parametrize("fmt", ["mxfp8", "mxfp4", "nvfp4", "nvfp4_4over6"])
 def test_quantized_contracts_are_the_blackwell_contract_with_a_format(fmt):
     from miles.true_on_policy.contracts import QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1, get_true_on_policy_contract
 

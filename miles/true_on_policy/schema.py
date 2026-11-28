@@ -10,6 +10,7 @@ TrueOnPolicyContractName = Literal[
     "qwen3_dense_blackwell_mxfp8_true_on_policy_v1",
     "qwen3_dense_blackwell_mxfp4_true_on_policy_v1",
     "qwen3_dense_blackwell_nvfp4_true_on_policy_v1",
+    "qwen3_dense_blackwell_nvfp4_4over6_true_on_policy_v1",
 ]
 ModelFamily = Literal["qwen3_dense", "qwen3_moe", "qwen3_next"]
 KernelContract = Literal["qwen3_dense_sglang_math"]
@@ -17,8 +18,8 @@ KernelContract = Literal["qwen3_dense_sglang_math"]
 # finished rollout, or the decode pass that sampled it (the sampler itself).
 LogprobContract = Literal["sglang_prefill", "sglang_decode"]
 # W+A quantization of the linear layers, run identically by the trainer and the sampler
-# (miles/kernels/quant/mx_linear.py)
-LinearQuant = Literal["mxfp8", "mxfp4", "nvfp4"]
+# (miles/kernels/quant/mx_linear.py); nvfp4_4over6: Four Over Six on the activations
+LinearQuant = Literal["mxfp8", "mxfp4", "nvfp4", "nvfp4_4over6"]
 
 
 @dataclass(frozen=True)
@@ -74,4 +75,9 @@ QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1_SCHEMA = replace(
 )
 QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA = replace(
     QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA, name="qwen3_dense_blackwell_nvfp4_true_on_policy_v1", linear_quant="nvfp4"
+)
+QWEN3_DENSE_BLACKWELL_NVFP4_4OVER6_TRUE_ON_POLICY_V1_SCHEMA = replace(
+    QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA,
+    name="qwen3_dense_blackwell_nvfp4_4over6_true_on_policy_v1",
+    linear_quant="nvfp4_4over6",
 )
