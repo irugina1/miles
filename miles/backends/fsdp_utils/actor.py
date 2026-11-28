@@ -207,7 +207,7 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         model, n = self._build_model_with_attn_bridge(checkpoint_path, self._get_init_weight_context_manager())
         if n > 0:
             logger.info(
-                f"[Rank {dist.get_rank()}] Applied triton attention patch to {n} layer(s) of {checkpoint_path}"
+                f"[Rank {dist.get_rank()}] Applied the {self.args.backend.attn_implementation} attention bridge to {n} layer(s) of {checkpoint_path}"
             )
 
         self.arch_adapter.patch_model(model, self.args)
@@ -217,7 +217,7 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         return model
 
     def _build_model_with_attn_bridge(self, checkpoint_path: str, init_context):
-        """Build HF model and optionally apply Triton attention bridge patch."""
+        """Build HF model and optionally apply the Triton or FA4 attention bridge patch."""
         if SNAPSHOT_TESTING_ENABLED:
             ConfigSnapshotDumper.dump(
                 stage="checkpoint_load", config={"args": self.args, "load": checkpoint_path, "format": "hf"}
@@ -225,7 +225,10 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         # ROCm-only: on other platforms "triton" falls through to from_pretrained, which rejects
         # it exactly as it did before this path existed.
         use_triton_bridge = self.args.backend.attn_implementation == "triton" and torch.version.hip is not None
-        effective_attn = "eager" if use_triton_bridge else self.args.backend.attn_implementation
+        # "fa4" is SGLang's vendored FlashAttention-4, called the way SGLang's decode calls it, so the
+        # trainer is bitwise the sampler; HF loads with eager and the bridge then swaps it in.
+        use_fa4_bridge = self.args.backend.attn_implementation == "fa4"
+        effective_attn = "eager" if use_triton_bridge or use_fa4_bridge else self.args.backend.attn_implementation
 
         with init_context():
             model = self._get_model_cls().from_pretrained(
@@ -239,6 +242,10 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
             from .sglang_attn_bridge.hf_sglang_triton_patch import apply_sglang_triton_attention_patch
 
             patched_layers = apply_sglang_triton_attention_patch(model)
+        elif use_fa4_bridge:
+            from .sglang_attn_bridge.hf_fa4_patch import apply_fa4_attention_patch
+
+            patched_layers = apply_fa4_attention_patch(model)
         return model, patched_layers
 
     def _enable_true_on_policy_optimizations(self, args):
@@ -331,11 +338,11 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         """No-grad forward. Logits stay in native bf16; the loss path upcasts
         per-response chunks, which avoids a full-vocab fp32 tensor."""
         model_args = self._get_model_inputs_args(batch)
-        with precision_forward_context(self.precision_policy):
+        with _fsdp_copy_in_on_current_stream(model), precision_forward_context(self.precision_policy):
             return model(**model_args).logits
 
     def _step_runner(self) -> LinearStepRunner:
-        return LinearStepRunner(self._forward, self._zero_grad, self._apply_step)
+        return _CopyInOnComputeStreamRunner(self.model, self._forward, self._zero_grad, self._apply_step)
 
     def _before_train(self) -> None:
         if SNAPSHOT_TESTING_ENABLED and not self._config_snapshot_train_recorded:
@@ -363,7 +370,7 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
         model_args = self._get_model_inputs_args(batch)
         replaying = routing_replay_manager.stage == routing_replay.REPLAY_BACKWARD
         replay_stage = routing_replay.stage(routing_replay.REPLAY_FORWARD) if replaying else nullcontext()
-        with replay_stage, precision_forward_context(self.precision_policy):
+        with replay_stage, _fsdp_copy_in_on_current_stream(self.model), precision_forward_context(self.precision_policy):
             return self.model(**model_args).logits
 
     def _zero_grad(self) -> None:
@@ -438,6 +445,38 @@ class FSDPTrainRayActor(TorchNativeTrainRayActor):
             model_args.update(batch["multimodal_train_inputs"])
 
         return model_args
+
+
+@contextmanager
+def _fsdp_copy_in_on_current_stream(model: torch.nn.Module):
+    """Run FSDP2's all-gather copy-in on the current stream; the all-gather keeps its own stream.
+
+    Used for every forward (logprob passes and the training forward) and, through
+    ``_CopyInOnComputeStreamRunner``, for the training backward, whose activation-checkpoint recompute
+    gathers each layer's parameters again. With the copy-in on its own stream, a forward after the train
+    state was offloaded and reloaded sometimes came out wrong on one rank. Nesting is fine: each exit
+    restores the stream it found."""
+    state = model._get_fsdp_state()
+    state._lazy_init()
+    comm = state._comm_ctx
+    saved = comm.all_gather_copy_in_stream
+    comm.all_gather_copy_in_stream = torch.cuda.current_stream()
+    try:
+        yield
+    finally:
+        comm.all_gather_copy_in_stream = saved
+
+
+class _CopyInOnComputeStreamRunner(LinearStepRunner):
+    """The training step with the copy-in on the compute stream for the backward as well as the forward."""
+
+    def __init__(self, model: torch.nn.Module, *args):
+        super().__init__(*args)
+        self._model = model
+
+    def forward_backward_step(self, batches, loss_closure):
+        with _fsdp_copy_in_on_current_stream(self._model):
+            return super().forward_backward_step(batches, loss_closure)
 
 
 @torch.no_grad()
