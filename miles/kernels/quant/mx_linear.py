@@ -42,6 +42,8 @@ NVFP4_GLOBAL_DIV = 448.0 * 6.0  # second-level scale = amax / (e4m3 max * e2m1 m
 # sizes, where the grid is a single row of programs.
 BLOCK_M, BLOCK_N, BLOCK_K = 128, 64, 128
 _NUM_WARPS, _NUM_STAGES = 4, 3
+# Blocks per quantizer program; bitwise-neutral (each block is quantized on its own).
+_QUANT_BLOCKS = 64
 
 
 @dataclass(frozen=True)
@@ -179,7 +181,7 @@ def quantize_rows(
     elif fmt == "nvfp4" and rows:  # each row's own amax / (448 * 6), straight into the buffer
         _row_global_scale_kernel[(rows,)](x, out.global_scale, x.stride(0), k, _NVFP4_GLOBAL_INV, BLOCK=1024, num_warps=4)
     if rows:
-        num_groups, groups_per_program = k // group, 8
+        num_groups, groups_per_program = k // group, _QUANT_BLOCKS
         _quantize_rows_kernel[(rows, triton.cdiv(num_groups, groups_per_program))](
             x,
             out.data,
