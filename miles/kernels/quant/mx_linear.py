@@ -13,8 +13,9 @@ kernels batch-invariant, so a token's result does not depend on the rest of the 
 Element rounding is round-to-nearest-even. MX block scales are ``2^ceil(log2(amax / elem_max))``
 (the block's largest element is never clipped); NVFP4 block scales are e4m3 ``amax / 6 / global``.
 
-The backward is not quantized: bf16 GEMMs (fp32 accumulation) on dequant(Q(W)) and dequant(Q(X)),
-straight through to the master weights.
+The backward is not quantized: bf16 GEMMs with fp32 outputs on exactly the values the forward multiplied,
+straight through to the master weights. Element x block scale is exact in bf16; nvfp4's fp32 second-level
+scales are applied outside the GEMMs.
 
 Which format a run uses is part of its true-on-policy contract (miles/true_on_policy); this module only
 holds the kernels.
@@ -229,9 +230,12 @@ def _e2m1_decode(code: torch.Tensor) -> torch.Tensor:
     return torch.where((c & 8) != 0, -mag, mag)
 
 
-def dequantize(t: MXTensor, dtype: torch.dtype = torch.bfloat16, chunk_rows: int = 1 << 14) -> torch.Tensor:
+def dequantize(
+    t: MXTensor, dtype: torch.dtype = torch.bfloat16, chunk_rows: int = 1 << 14, with_global: bool = True
+) -> torch.Tensor:
     """The values the GEMM multiplies (elements x block scale x nvfp4 second-level scale), computed in
-    fp32 and rounded once to ``dtype``. Works in row chunks to bound the fp32 temporaries."""
+    fp32 and rounded once to ``dtype``, in row chunks. ``with_global=False`` leaves out nvfp4's second-level
+    scale, making the result exact in bf16."""
     group, pack = _GROUP[t.fmt], _PACK[t.fmt]
     rows = t.data.shape[0]
     k = t.data.shape[1] * pack
@@ -248,7 +252,7 @@ def dequantize(t: MXTensor, dtype: torch.dtype = torch.bfloat16, chunk_rows: int
         else:
             factor = torch.exp2(s.view(torch.uint8).float() - 127)
         scaled = (values.view(-1, k // group, group) * factor[..., None]).view(-1, k)
-        if t.global_scale is not None:  # applied after the block scale, as the GEMM does
+        if with_global and t.global_scale is not None:  # applied after the block scale, as the GEMM does
             scaled = scaled * t.global_scale[r0 : r0 + chunk_rows, None]
         out[r0 : r0 + chunk_rows] = scaled.to(dtype)
     return out
@@ -391,9 +395,13 @@ class MXLinearFunction(torch.autograd.Function):
         qx = MXTensor(fmt, qx_data, qx_scale, qx_global[0] if qx_global else None)
         qw = quantize_weight(weight.to(torch.bfloat16), fmt)
         g = grad_out.reshape(-1, grad_out.shape[-1]).to(torch.bfloat16)
+        w_q, x_q = dequantize(qw, with_global=False), dequantize(qx, with_global=False)
         with torch.autocast(device_type="cuda", enabled=False):
-            grad_x = g @ dequantize(qw)
-            grad_w = g.t() @ dequantize(qx)
+            grad_x = torch.mm(g, w_q, out_dtype=torch.float32)
+            if qx.global_scale is not None:  # nvfp4: one scale per trainer weight, one per token
+                grad_x *= qw.global_scale[0]
+                g = (g * qx.global_scale[:, None]).to(torch.bfloat16)
+            grad_w = torch.mm(g.t(), x_q, out_dtype=torch.float32)
         return grad_x.view(ctx.x_shape).to(ctx.x_dtype), grad_w.to(weight.dtype), None
 
 

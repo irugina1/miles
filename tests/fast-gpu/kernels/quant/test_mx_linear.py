@@ -141,8 +141,30 @@ def test_backward_is_bf16_gemm_on_dequantized_operands(fmt):
     grad = torch.randn_like(out)
     out.backward(grad)
     g = grad.to(torch.bfloat16)
-    qw = dequantize(quantize_weight(w32.detach().to(torch.bfloat16), fmt))
-    qx = dequantize(quantize_rows(x.detach().to(torch.bfloat16), fmt))
+    qw = quantize_weight(w32.detach().to(torch.bfloat16), fmt)
+    qx = quantize_rows(x.detach().to(torch.bfloat16), fmt)
+    w_q, x_q = dequantize(qw, with_global=False), dequantize(qx, with_global=False)
+    expected_x = torch.mm(g, w_q, out_dtype=torch.float32)
+    if qx.global_scale is not None:
+        expected_x = expected_x * qw.global_scale[0]
+        g = (g * qx.global_scale[:, None]).to(torch.bfloat16)
     assert x.grad.dtype == torch.float32 and w32.grad.dtype == torch.float32
-    assert torch.equal(x.grad, (g @ qw).float())
-    assert torch.equal(w32.grad, (g.t() @ qx).float())
+    assert torch.equal(x.grad, expected_x)
+    assert torch.equal(w32.grad, torch.mm(g.t(), x_q, out_dtype=torch.float32))
+
+
+@pytest.mark.parametrize("fmt", FORMATS)
+def test_backward_operands_are_exactly_the_forward_values(fmt):
+    """The backward GEMMs' bf16 operands are exact: the values the forward multiplied."""
+    from miles.kernels.quant.mx_linear import dequantize, quantize_rows, quantize_weight
+
+    (w,) = _weights([KV], HIDDEN)
+    x = _activations(300, HIDDEN)
+    x[3] = 0
+    for t in (quantize_weight(w.to(torch.bfloat16), fmt), quantize_rows(x, fmt)):
+        with_global = t.global_scale is None  # nvfp4's fp32 scale is applied outside the GEMMs
+        exact = dequantize(t, torch.float64, with_global=with_global)
+        assert torch.equal(dequantize(t, torch.bfloat16, with_global=with_global).double(), exact)
+    qw = quantize_weight(w.to(torch.bfloat16), fmt)
+    if qw.global_scale is not None:  # one per trainer weight, as the backward assumes
+        assert (qw.global_scale == qw.global_scale[0]).all()
