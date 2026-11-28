@@ -10,6 +10,7 @@ TrueOnPolicyContractName = Literal[
     "qwen3_dense_blackwell_mxfp8_true_on_policy_v1",
     "qwen3_dense_blackwell_mxfp4_true_on_policy_v1",
     "qwen3_dense_blackwell_nvfp4_true_on_policy_v1",
+    "qwen3_dense_blackwell_nvfp4_mxfp8_tail_true_on_policy_v1",
 ]
 ModelFamily = Literal["qwen3_dense", "qwen3_moe", "qwen3_next"]
 KernelContract = Literal["qwen3_dense_sglang_math"]
@@ -34,6 +35,14 @@ class TrueOnPolicyContractSchema:
     disable_megatron_sequence_parallel: bool
     # None: bf16 linear layers
     linear_quant: LinearQuant | None = None
+    # the last ``linear_quant_tail_fraction`` of decoder layers (rounded to nearest) run ``linear_quant_tail``
+    linear_quant_tail: LinearQuant | None = None
+    linear_quant_tail_fraction: float = 0.0
+
+    def __post_init__(self):
+        tail, fraction = self.linear_quant_tail, self.linear_quant_tail_fraction
+        if (fraction != 0.0) if tail is None else (self.linear_quant is None or not 0.0 < fraction <= 1.0):
+            raise ValueError(f"{self.name}: a linear_quant_tail needs a linear_quant and a fraction in (0, 1]")
 
 
 # Qwen3 dense on Hopper (SM90), FlashAttention-3 on both sides. The trainer matches an SGLang prefill
@@ -74,4 +83,12 @@ QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1_SCHEMA = replace(
 )
 QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA = replace(
     QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA, name="qwen3_dense_blackwell_nvfp4_true_on_policy_v1", linear_quant="nvfp4"
+)
+# NVFP4 with the last sixth of the decoder layers in MXFP8, as in Thinking Machines' 4-bit recipe
+# (Qwen3-4B: layers 30-35)
+QWEN3_DENSE_BLACKWELL_NVFP4_MXFP8_TAIL_TRUE_ON_POLICY_V1_SCHEMA = replace(
+    QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA,
+    name="qwen3_dense_blackwell_nvfp4_mxfp8_tail_true_on_policy_v1",
+    linear_quant_tail="mxfp8",
+    linear_quant_tail_fraction=1 / 6,
 )

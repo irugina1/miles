@@ -58,5 +58,6 @@ class Qwen3Adapter(ArchAdapter):
         apply_qwen3_dense_true_on_policy_patch(model)
         contract = get_true_on_policy_contract(args.sglang.common_value("true_on_policy_contract"))
         if contract.linear_quant is not None:
-            n = apply_qwen3_dense_linear_quant(model, contract.linear_quant)
-            logger.warning(f"Qwen3 dense: {n} projections run the {contract.linear_quant} W+A kernels ({contract.name})")
+            n = apply_qwen3_dense_linear_quant(model, contract)
+            layers = contract.describe_linear_quant(len(getattr(model, "model", model).layers))  # config-access-exempt: HF wrappers differ
+            logger.warning(f"Qwen3 dense: {n} projections quantized ({layers}; {contract.name})")

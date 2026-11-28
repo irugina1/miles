@@ -45,14 +45,16 @@ def apply_qwen3_dense_true_on_policy_patch(model) -> bool:
 QUANTIZED_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
 
 
-def apply_qwen3_dense_linear_quant(model, fmt: str) -> int:
-    """Swap every decoder layer's projections to Miles' quantized linear in format ``fmt``, the kernels the
-    SGLang plugin runs on the engines (miles/kernels/quant/mx_linear.py). Returns the count."""
+def apply_qwen3_dense_linear_quant(model, contract) -> int:
+    """Swap every decoder layer's projections to Miles' quantized linear in the contract's format for that
+    layer, the kernels the SGLang plugin runs on the engines (miles/kernels/quant/mx_linear.py). Returns
+    the count."""
     from miles.kernels.quant.mx_linear import swap_to_mx_linear
 
     base_model = getattr(model, "model", model)  # config-access-exempt: HF wrappers differ in base-model layout
     swapped = 0
-    for layer in base_model.layers:
+    for i, layer in enumerate(base_model.layers):
+        fmt = contract.linear_quant_of_layer(i, len(base_model.layers))
         for block in (layer.self_attn, layer.mlp):
             for name in QUANTIZED_PROJECTIONS:
                 linear = getattr(block, name, None)  # config-access-exempt: q/k/v/o live in self_attn, the rest in mlp

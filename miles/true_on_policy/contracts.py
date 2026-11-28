@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .schema import (
     QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA,
+    QWEN3_DENSE_BLACKWELL_NVFP4_MXFP8_TAIL_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_DENSE_BLACKWELL_BF16_TRUE_ON_POLICY_V1_SCHEMA,
     QWEN3_DENSE_HOPPER_BF16_TRUE_ON_POLICY_V1_SCHEMA,
     KernelContract,
@@ -51,6 +53,23 @@ class TrueOnPolicyContract:
     def linear_quant(self) -> LinearQuant | None:
         return self.schema.linear_quant
 
+    def linear_quant_of_layer(self, layer: int, num_layers: int) -> LinearQuant | None:
+        """The format of decoder layer ``layer`` (0-based) of ``num_layers``."""
+        tail = math.floor(num_layers * self.schema.linear_quant_tail_fraction + 0.5)  # nearest, halves up
+        if self.schema.linear_quant_tail is not None and layer >= num_layers - tail:
+            return self.schema.linear_quant_tail
+        return self.linear_quant
+
+    def describe_linear_quant(self, num_layers: int) -> str:
+        """E.g. ``nvfp4: layers 0-29, mxfp8: layers 30-35``, for logs."""
+        formats = [self.linear_quant_of_layer(i, num_layers) for i in range(num_layers)]
+        runs, start = [], 0
+        for i in range(1, num_layers + 1):
+            if i == num_layers or formats[i] != formats[start]:
+                runs.append(f"{formats[start]}: layers {start}-{i - 1}")
+                start = i
+        return ", ".join(runs)
+
     @property
     def disable_megatron_sequence_parallel(self) -> bool:
         return self.schema.disable_megatron_sequence_parallel
@@ -95,6 +114,9 @@ QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
 QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
     schema=QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1_SCHEMA,
 )
+QWEN3_DENSE_BLACKWELL_NVFP4_MXFP8_TAIL_TRUE_ON_POLICY_V1 = TrueOnPolicyContract(
+    schema=QWEN3_DENSE_BLACKWELL_NVFP4_MXFP8_TAIL_TRUE_ON_POLICY_V1_SCHEMA,
+)
 
 
 _CONTRACT_BY_NAME = {
@@ -105,6 +127,7 @@ _CONTRACT_BY_NAME = {
         QWEN3_DENSE_BLACKWELL_MXFP8_TRUE_ON_POLICY_V1,
         QWEN3_DENSE_BLACKWELL_MXFP4_TRUE_ON_POLICY_V1,
         QWEN3_DENSE_BLACKWELL_NVFP4_TRUE_ON_POLICY_V1,
+        QWEN3_DENSE_BLACKWELL_NVFP4_MXFP8_TAIL_TRUE_ON_POLICY_V1,
     )
 }
 

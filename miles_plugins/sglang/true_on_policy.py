@@ -7,7 +7,7 @@ Without it the engines reject the contract name at startup.
 
 Under a quantized contract (``linear_quant`` set, e.g. ``qwen3_dense_blackwell_nvfp4_true_on_policy_v1``)
 it also runs the Qwen3 dense projections with Miles' quantized linear kernels
-(miles/kernels/quant/mx_linear.py), the ones the trainer runs. The engines keep the bf16 weights that
+(miles/kernels/quant/mx_linear.py), the ones the trainer runs, in the contract's format for each layer. The engines keep the bf16 weights that
 weight sync writes; after every load the quantized copy is refreshed in place, so captured CUDA graphs
 keep reading valid weights.
 """
@@ -21,10 +21,11 @@ from sglang.srt.plugins.hook_registry import HookRegistry, HookType
 _UNQUANT_LINEAR = "sglang.srt.layers.quantization.unquant.UnquantizedLinearMethod"
 _QWEN3_INIT = "sglang.srt.models.qwen3.Qwen3ForCausalLM.__init__"
 # SGLang's (possibly merged) Qwen3 projections; every one is quantized under a quantized contract
-_PROJECTION = re.compile(r"(?:^|\.)layers\.\d+\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.(?:gate_up_proj|down_proj))$")
+_PROJECTION = re.compile(r"(?:^|\.)layers\.(\d+)\.(?:self_attn\.(?:qkv_proj|o_proj)|mlp\.(?:gate_up_proj|down_proj))$")
 _CACHE_ATTR = "_miles_mx_weight"
-# SGLang sets ``prefix`` on some linear classes only, so the model tags each module with its name
+# SGLang sets ``prefix`` on some linear classes only, so the model tags each module with its name and format
 _NAME_ATTR = "_miles_module_name"
+_FORMAT_ATTR = "_miles_linear_quant"
 
 logger = logging.getLogger(__name__)
 
@@ -47,35 +48,40 @@ def _register_contracts() -> None:
 
 
 @functools.cache
-def _linear_quant() -> str | None:
-    """The engine's quantization format, from its true-on-policy contract (None: bf16 linears)."""
+def _quantized_contract():
+    """The engine's true-on-policy contract when it quantizes linears, else None."""
     from sglang.srt.runtime_context import get_server_args
 
     from miles.true_on_policy.contracts import all_true_on_policy_contracts
 
     name = getattr(get_server_args(), "true_on_policy_contract", None)
     contract = {c.name: c for c in all_true_on_policy_contracts()}.get(name)
-    fmt = contract.linear_quant if contract is not None else None
-    if fmt is not None:
-        logger.warning(f"Miles plugin: Qwen3 dense projections run the {fmt} W+A kernels ({name})")
-    return fmt
+    return contract if contract is not None and contract.linear_quant is not None else None
 
 
-def _is_quantized_projection(name: str) -> bool:
-    return _PROJECTION.search(name) is not None
+def _projection_format(name: str, num_layers: int) -> str | None:
+    match = _PROJECTION.search(name)
+    if match is None or (contract := _quantized_contract()) is None:
+        return None
+    return contract.linear_quant_of_layer(int(match.group(1)), num_layers)
 
 
 def _tag_module_names(result, self, *args, **kwargs):
+    num_layers = self.config.num_hidden_layers
+    if (contract := _quantized_contract()) is not None:
+        logger.warning(f"Miles plugin: Qwen3 dense W+A kernels, {contract.describe_linear_quant(num_layers)} ({contract.name})")
     for name, module in self.named_modules():
         setattr(module, _NAME_ATTR, name)  # config-access-exempt: plugin-owned tag
+        setattr(module, _FORMAT_ATTR, _projection_format(name, num_layers))  # config-access-exempt: plugin-owned tag
     return result
 
 
 def _refresh_quantized_weight(result, self, layer, *args, **kwargs):
     """Re-quantize the layer's bf16 weight after a load, into the cached buffers when they exist."""
-    name = getattr(layer, _NAME_ATTR, None)  # config-access-exempt: set on Qwen3 models only
-    if name is None or not _is_quantized_projection(name) or (fmt := _linear_quant()) is None:
+    fmt = getattr(layer, _FORMAT_ATTR, None)  # config-access-exempt: set on Qwen3 models only
+    if fmt is None:
         return result
+    name = getattr(layer, _NAME_ATTR)  # config-access-exempt: tagged with the format
     from miles.kernels.quant.mx_linear import quantize_weight
 
     if getattr(layer, "bias", None) is not None:  # config-access-exempt: Qwen3 projections have no bias
