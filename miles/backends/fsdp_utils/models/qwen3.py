@@ -39,3 +39,27 @@ def apply_qwen3_dense_true_on_policy_patch(model) -> bool:
         raise TypeError("Expected a Qwen3 model with a final Qwen3RMSNorm")
     final_norm.__class__ = Qwen3FinalRMSNorm
     return True
+
+
+# every projection of a decoder layer; embeddings, lm_head and norms stay bf16
+QUANTIZED_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj")
+
+
+def apply_qwen3_dense_linear_quant(model, fmt: str) -> int:
+    """Swap every decoder layer's projections to Miles' quantized linear in format ``fmt``, the kernels the
+    SGLang plugin runs on the engines (miles/kernels/quant/mx_linear.py). Returns the count."""
+    from miles.kernels.quant.mx_linear import swap_to_mx_linear
+
+    base_model = getattr(model, "model", model)  # config-access-exempt: HF wrappers differ in base-model layout
+    swapped = 0
+    for layer in base_model.layers:
+        for block in (layer.self_attn, layer.mlp):
+            for name in QUANTIZED_PROJECTIONS:
+                linear = getattr(block, name, None)  # config-access-exempt: q/k/v/o live in self_attn, the rest in mlp
+                if linear is not None:
+                    swap_to_mx_linear(linear, fmt)
+                    swapped += 1
+    expected = len(base_model.layers) * len(QUANTIZED_PROJECTIONS)
+    if swapped != expected:
+        raise RuntimeError(f"quantized {swapped} Qwen3 projections, expected {expected}")
+    return swapped
